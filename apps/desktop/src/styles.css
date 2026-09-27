@@ -1,0 +1,580 @@
+:root {
+  color-scheme: dark;
+  --bg: #10141a;
+  --bg-2: #171d26;
+  --bg-3: #1f2733;
+  --border: #2c3644;
+  --text: #e6ebf2;
+  --text-dim: #93a1b3;
+  --accent: #4c9aff;
+  --ok: #3fb27f;
+  --warn: #d9a441;
+  --err: #e05661;
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.mono {
+  font-family: Consolas, "Courier New", monospace;
+}
+
+/* ---------- 模态框（指纹确认 / 密码输入） ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 100;
+}
+
+.modal-box {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  width: min(480px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.modal-box h3 {
+  margin: 0;
+}
+
+.modal-box .fingerprint {
+  word-break: break-all;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  margin: 0;
+}
+
+.modal-box label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.modal-box label.radio {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---------- 错误提示 ---------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 88px;
+  transform: translateX(-50%);
+  background: var(--bg-3);
+  border: 1px solid var(--err);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  max-width: min(640px, 90vw);
+  z-index: 90;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ---------- 主机初始化 ---------- */
+.host-init-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.host-init-section h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-size: 16px;
+  margin: 0;
+  letter-spacing: 1px;
+}
+
+.backend-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+}
+
+#btn-hide-to-tray {
+  flex-shrink: 0;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-off {
+  background: var(--err);
+}
+
+.dot-on {
+  background: var(--ok);
+}
+
+/* ---------- 离线横幅 ---------- */
+.offline-banner {
+  padding: 6px 14px;
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  border-bottom: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 13px;
+}
+
+/* ---------- 会话标签 ---------- */
+.session-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 0;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  min-height: 40px;
+}
+
+.tabs-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 6px 4px;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tab[aria-selected="true"] {
+  background: var(--bg);
+  border-bottom-color: var(--bg);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.tab .tab-state {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+.tab-state.attached {
+  background: color-mix(in srgb, var(--ok) 25%, transparent);
+  color: var(--ok);
+}
+
+.tab-state.detached {
+  background: color-mix(in srgb, var(--warn) 22%, transparent);
+  color: var(--warn);
+}
+
+.tab-state.closed,
+.tab-state.error {
+  background: color-mix(in srgb, var(--err) 22%, transparent);
+  color: var(--err);
+}
+
+.tab .role {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.tab button {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 2px;
+}
+
+.tab button:hover {
+  color: var(--err);
+}
+
+/* ---------- 主布局 ---------- */
+.workspace {
+  display: grid;
+  grid-template-columns: 280px 1fr 280px;
+  gap: 10px;
+  padding: 10px;
+  height: calc(100% - 40px - 108px);
+  min-height: 300px;
+}
+
+.panel {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.panel-profiles,
+.panel-host {
+  overflow-y: auto;
+}
+
+/* ---------- 连接配置 ---------- */
+.profile-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.profile-item {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+.profile-item .profile-title {
+  font-weight: 600;
+}
+
+.profile-item .profile-meta {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.profile-item .profile-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.profile-form {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profile-form h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+input,
+textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 9px;
+  font: inherit;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.auth-choice {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.auth-choice legend {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+
+.radio {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#btn-send,
+#pf-save,
+#host-enable {
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-3));
+  border-color: var(--accent);
+}
+
+#host-stop {
+  background: color-mix(in srgb, var(--err) 18%, var(--bg-3));
+  border-color: var(--err);
+}
+
+/* ---------- 终端 ---------- */
+.panel-terminal {
+  position: relative;
+}
+
+.terminal-stack {
+  position: absolute;
+  inset: 0;
+  display: none;
+}
+
+.terminal-stack.active {
+  display: block;
+}
+
+.terminal-stack > .terminal-instance {
+  position: absolute;
+  inset: 0;
+  padding: 6px;
+}
+
+.terminal-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 20px;
+}
+
+/* ---------- 主机面板 ---------- */
+.host-panel-content {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.host-meta {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  font-size: 13px;
+}
+
+.host-meta dt {
+  color: var(--text-dim);
+}
+
+.host-meta dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 10px;
+}
+
+.badge-stopped {
+  background: color-mix(in srgb, var(--err) 20%, transparent);
+  color: var(--err);
+}
+
+.badge-running {
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
+  color: var(--ok);
+}
+
+.host-placeholder {
+  padding: 16px;
+  color: var(--text-dim);
+}
+
+/* ---------- 底部输入区 ---------- */
+.composer {
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  padding: 8px 12px;
+  height: 108px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.composer > label {
+  flex-direction: row;
+  font-size: 12px;
+}
+
+.composer-row {
+  display: flex;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+
+.composer-row input#composer-input {
+  flex: 1;
+  resize: none;
+}
+
+.composer-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+/* ---------- 后端断开占位 ---------- */
+.backend-disconnected {
+  position: fixed;
+  inset: 40px 0 0 0;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(2px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  z-index: 50;
+  text-align: center;
+  padding: 20px;
+}
+
+.backend-disconnected h2 {
+  margin: 0;
+  color: var(--err);
+}
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 1100px) {
+  .workspace {
+    grid-template-columns: 240px 1fr 240px;
+  }
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(160px, auto) 1fr minmax(160px, auto);
+    height: auto;
+    overflow-y: auto;
+  }
+
+  .panel-terminal {
+    min-height: 320px;
+  }
+
+  .composer {
+    height: auto;
+  }
+}

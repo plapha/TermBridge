@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TermBridge 桌面终端</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <h1 class="brand">TermBridge</h1>
+        <div id="backend-status" class="backend-status" role="status" aria-live="polite">
+          <span class="dot dot-off" aria-hidden="true"></span>
+          <span id="backend-status-text">后端未连接</span>
+        </div>
+        <button id="btn-hide-to-tray" type="button" title="隐藏窗口到托盘，托盘图标可找回">隐藏到托盘</button>
+      </header>
+
+      <div id="offline-banner" class="offline-banner hidden" role="alert">
+        连接已断开，画面已暂停。请从“已有终端”重新附着，不会自动重发命令。
+      </div>
+
+      <nav id="session-tabs" class="session-tabs" role="tablist" aria-label="会话标签">
+        <span id="tabs-empty" class="tabs-empty">暂无会话，请从左侧选择一个连接配置并点击“连接”。</span>
+      </nav>
+
+      <main class="workspace">
+        <aside class="panel panel-profiles" aria-label="连接配置">
+          <div class="panel-header">
+            <h2>连接配置</h2>
+            <button id="btn-new-profile" type="button">新建</button>
+          </div>
+          <ul id="profile-list" class="profile-list" aria-label="已保存的连接配置列表"></ul>
+
+          <form id="profile-form" class="profile-form hidden" aria-label="连接配置编辑">
+            <h3 id="profile-form-title">新建连接配置</h3>
+            <label>
+              名称
+              <input id="pf-name" name="name" type="text" required autocomplete="off" />
+            </label>
+            <label>
+              主机 / IP
+              <input id="pf-host" name="host" type="text" required autocomplete="off" spellcheck="false" />
+            </label>
+            <label>
+              端口
+              <input id="pf-port" name="port" type="number" min="1" max="65535" value="22333" required />
+            </label>
+            <label>
+              用户名
+              <input id="pf-user" name="user" type="text" required autocomplete="off" spellcheck="false" />
+            </label>
+            <fieldset class="auth-choice">
+              <legend>认证方式</legend>
+              <label class="radio">
+                <input type="radio" name="auth" value="password" />
+                产品专用密码（兼容旧配置；仅勾选“记住密码”才保存）
+              </label>
+              <label class="radio">
+                <input type="radio" name="auth" value="key" checked />
+                复用 SSH 私钥（推荐；只引用路径，不复制内容）
+              </label>
+            </fieldset>
+            <label id="pf-key-row">
+              SSH 私钥路径（可留空，自动寻找 ~/.ssh/id_ed25519 等）
+              <input id="pf-key-path" type="text" placeholder="留空使用已有 SSH 私钥" spellcheck="false" />
+            </label>
+            <p class="hint">仅在明确选择“记住密码”时才存入系统凭据库，不写入配置文件。</p>
+            <div class="form-actions">
+              <button id="pf-save" type="submit">保存</button>
+              <button id="pf-cancel" type="button">取消</button>
+            </div>
+          </form>
+        </aside>
+
+        <section class="panel panel-terminal" aria-label="终端视窗">
+          <div id="terminal-stack" class="terminal-stack"></div>
+          <div id="terminal-placeholder" class="terminal-placeholder">
+            <p>尚未附加到任何会话。</p>
+            <p class="hint">此视窗为<strong>只读</strong>：键盘输入不会发送到主机。请在下方输入框编写内容并点击“发送”。</p>
+          </div>
+        </section>
+
+        <aside class="panel panel-host" aria-label="主机模式">
+          <div class="panel-header">
+            <h2>本应用接收端</h2>
+            <span id="host-state-badge" class="badge badge-stopped">已停止</span>
+          </div>
+          <div id="host-panel-content" class="host-panel-content">
+            <div id="host-init-section" class="host-init-section hidden">
+              <h3>初始化接收端</h3>
+              <fieldset class="auth-choice">
+                <legend>选择接收端认证</legend>
+                <label class="radio"><input type="radio" name="host-auth" value="key" checked />复用现有 SSH 授权公钥（推荐，无需额外密码）</label>
+                <label class="radio"><input type="radio" name="host-auth" value="password" />产品专用密码</label>
+              </fieldset>
+              <label id="host-init-key-row">
+                SSH authorized_keys 文件路径
+                <input id="host-init-key-path" type="text" placeholder="留空使用 ~/.ssh/authorized_keys" spellcheck="false" />
+              </label>
+              <label id="host-init-password-row" class="hidden">
+                接收密码（至少 12 字符）
+                <input id="host-init-password" type="password" minlength="12" autocomplete="new-password" />
+              </label>
+              <p class="hint">只在你明确选择时读取授权公钥；带 from=/command= 等 SSH 限制选项的条目会被拒绝，避免放宽原有权限。私钥不会复制到本产品。</p>
+              <div class="form-actions">
+                <button id="host-init" type="button">初始化</button>
+              </div>
+            </div>
+            <label>
+              监听地址
+              <select id="host-bind-select" aria-label="监听地址选择">
+                <option value="127.0.0.1" selected>仅本机 (127.0.0.1)</option>
+                <option value="0.0.0.0">所有网卡 (0.0.0.0)</option>
+                <option value="::1">仅本机 IPv6 (::1)</option>
+                <option value="custom">Tailscale / 自定义 IP…</option>
+              </select>
+            </label>
+            <label id="host-bind-custom-row" class="hidden">
+              自定义监听 IP
+              <input id="host-bind-custom" type="text" placeholder="100.x.y.z（Tailscale IP）" spellcheck="false" />
+            </label>
+            <label>
+              监听端口
+              <input id="host-port" type="number" min="1" max="65535" value="22333" required />
+            </label>
+            <dl class="host-meta">
+              <dt>状态</dt>
+              <dd id="host-status-text">未知</dd>
+              <dt>指纹</dt>
+              <dd id="host-fingerprint" class="mono">—</dd>
+              <dt>认证</dt>
+              <dd id="host-auth-status">—</dd>
+              <dt>控制器</dt>
+              <dd id="host-controller">—</dd>
+            </dl>
+            <div class="form-actions">
+              <button id="host-enable" type="button">启用</button>
+              <button id="host-stop" type="button" disabled>停止本应用接收</button>
+            </div>
+            <div id="host-migrate-section" class="host-init-section hidden">
+              <h3>已有接收端：改用现有 SSH 密钥</h3>
+              <label>SSH authorized_keys 文件路径
+                <input id="host-migrate-key-path" type="text" placeholder="留空使用 ~/.ssh/authorized_keys" spellcheck="false" />
+              </label>
+              <p class="hint">先停止本应用接收；导入公钥后会关闭旧产品密码。若 CLI 服务另行运行，也需手动重启才能生效。</p>
+              <button id="host-migrate-keys" type="button">改为仅 SSH 密钥</button>
+            </div>
+          </div>
+          <div id="host-placeholder" class="host-placeholder hidden">
+            <p>后端不可用，无法管理主机模式。</p>
+          </div>
+        </aside>
+      </main>
+
+      <footer class="composer" aria-label="文本输入区">
+        <label for="composer-input">发送内容（仅点击“发送”按钮才会传输到主机）</label>
+        <div class="composer-row">
+          <input
+            id="composer-input"
+            type="text"
+            placeholder="在此编辑单行命令；只有点击右侧按钮才发送"
+            spellcheck="false"
+            autocomplete="off"
+          />
+          <div class="composer-actions">
+            <button id="btn-send" type="button" disabled>发送</button>
+            <span id="composer-target" class="hint">未选择会话</span>
+          </div>
+        </div>
+      </footer>
+
+      <div id="fp-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fp-modal-title">
+        <div class="modal-box">
+          <h3 id="fp-modal-title">确认主机指纹</h3>
+          <p id="fp-modal-host" class="mono"></p>
+          <p id="fp-modal-value" class="mono fingerprint"></p>
+          <p class="hint">请核对该指纹与受信来源一致后再确认；本应用不会自动信任任何主机。</p>
+          <div class="form-actions">
+            <button id="fp-confirm" type="button">确认并信任该主机</button>
+            <button id="fp-cancel" type="button">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="existing-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="existing-modal-title">
+        <div class="modal-box">
+          <h3 id="existing-modal-title">附着已有终端</h3>
+          <p class="hint">选择仍在运行的远端会话；不会新建替代终端。</p>
+          <label>远端会话<select id="existing-session-list"></select></label>
+          <div class="form-actions">
+            <button id="existing-ok" type="button">附着</button>
+            <button id="existing-cancel" type="button">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="pw-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pw-modal-title">
+        <div class="modal-box">
+          <h3 id="pw-modal-title">连接密码</h3>
+          <p id="pw-modal-host" class="mono"></p>
+          <label>
+            <span id="pw-modal-label">密码</span>
+            <input id="pw-input" type="password" autocomplete="current-password" />
+          </label>
+          <label id="pw-remember-row" class="radio">
+            <input id="pw-remember" type="checkbox" />
+            记住密码（写入系统凭据库）
+          </label>
+          <p id="pw-modal-hint" class="hint">不勾选时密码仅用于本次连接，不会被保存或记录。</p>
+          <div class="form-actions">
+            <button id="pw-ok" type="button">连接</button>
+            <button id="pw-cancel" type="button">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="toast" class="toast hidden" role="alert"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

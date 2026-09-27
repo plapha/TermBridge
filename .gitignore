@@ -1,0 +1,16 @@
+/target
+/node_modules
+/dist
+*.log
+# 本机凭据、SSH 私钥及证书不得提交
+**/.env
+**/.env.*
+!**/.env.example
+**/id_ed25519
+**/id_ecdsa
+**/id_rsa
+**/host_key
+*.pem
+*.p12
+*.pfx
+*.key

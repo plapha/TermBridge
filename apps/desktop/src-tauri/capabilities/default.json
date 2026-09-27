@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "TermBridge 桌面端默认权限（核心能力；具体命令权限由后端所有者按需补充）",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
