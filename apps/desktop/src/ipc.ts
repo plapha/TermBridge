@@ -129,11 +129,14 @@ export const commands = {
     invoke<RemoteSession[]>("list_remote_sessions", { profile_id: profileId, password: password ?? null }),
   connectExistingSession: (profileId: string, sessionId: string, password?: string) =>
     invoke<CreateSessionResult>("connect_existing_session", { profile_id: profileId, session_id: sessionId, password: password ?? null }),
-  /** password 仅为密码认证档案的本次连接密码；不传则由后端回退到凭据库。 */
-  createSession: (profileId: string, password?: string) =>
+  /** password 仅为密码认证档案的本次连接密码；不传则由后端回退到凭据库。
+   *  rows/cols 是前端实际 fit 出的尺寸。 */
+  createSession: (profileId: string, password?: string, rows?: number, cols?: number) =>
     invoke<CreateSessionResult>("create_session", {
       profile_id: profileId,
       password: password ?? null,
+      rows: rows ?? 24,
+      cols: cols ?? 80,
     }),
   /** resumeFrom：已显示到的输出偏移；服务端优先重放补洞，越界则给快照。 */
   attachSession: (sessionId: string, resumeFrom?: number | null) =>
@@ -148,6 +151,9 @@ export const commands = {
   /** 原始终端输入字节；仅控制器可用，只读实例会被服务端拒绝。 */
   sendInput: (sessionId: string, data: number[]) =>
     invoke<void>("send_input", { session_id: sessionId, data }),
+  /** 控制者按前端 fit 结果调整远端 PTY 尺寸。 */
+  resizeSession: (sessionId: string, rows: number, cols: number) =>
+    invoke<void>("resize_session", { session_id: sessionId, rows, cols }),
   takeControl: (sessionId: string) =>
     invoke<TakeControlResult>("take_control", { session_id: sessionId }),
 };

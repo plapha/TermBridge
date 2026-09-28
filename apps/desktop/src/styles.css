@@ -252,7 +252,7 @@ body {
   grid-template-columns: 280px 1fr 280px;
   gap: 10px;
   padding: 10px;
-  height: calc(100% - 40px - 108px);
+  height: calc(100% - 40px);
   min-height: 300px;
 }
 
@@ -498,40 +498,19 @@ button:disabled {
   color: var(--text-dim);
 }
 
-/* ---------- 底部输入区 ---------- */
-.composer {
-  border-top: 1px solid var(--border);
-  background: var(--bg-2);
-  padding: 8px 12px;
-  height: 108px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.composer > label {
-  flex-direction: row;
+/* ---------- 终端提示条 ---------- */
+.terminal-hint {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-2));
+  border: 1px solid var(--border);
   font-size: 12px;
-}
-
-.composer-row {
-  display: flex;
-  gap: 10px;
-  flex: 1;
-  min-height: 0;
-}
-
-.composer-row input#composer-input {
-  flex: 1;
-  resize: none;
-}
-
-.composer-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  justify-content: flex-start;
-  gap: 6px;
+  color: var(--text);
+  pointer-events: none;
 }
 
 /* ---------- 后端断开占位 ---------- */
@@ -572,9 +551,5 @@ button:disabled {
 
   .panel-terminal {
     min-height: 320px;
-  }
-
-  .composer {
-    height: auto;
   }
 }

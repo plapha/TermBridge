@@ -16,5 +16,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 keyring = "3"
+base64 = "0.22"
 termbridge = { path = "../../../crates/app" }
 termbridge-protocol = { path = "../../../crates/protocol" }
+
+# M2：屏蔽 WebView2 浏览器快捷键（主要给 ICoreWebView2Settings3 的 cast）。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"

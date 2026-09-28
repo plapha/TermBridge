@@ -4,7 +4,7 @@
 //! 每个远端会话对应一个 `Arc<Session>`，pump 任务独占 SSH 客户端。
 //! v2：每个标签页固定一个 `stream_id`；输入偏移与已确认偏移在这里维护。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{atomic::AtomicBool, Mutex};
 
 use serde::Serialize;
@@ -19,8 +19,6 @@ pub type RespResult = Result<termbridge_protocol::Response, String>;
 /// 发给 pump 任务的控制命令。
 pub enum PumpCmd {
     Request(Request, oneshot::Sender<RespResult>),
-    /// 原始终端输入字节；由 pump 切块并按偏移发送。
-    Input(Vec<u8>),
     Close(oneshot::Sender<()>),
 }
 
@@ -57,7 +55,14 @@ pub struct Session {
     pub input_acked: Mutex<u64>,
     /// 与请求通道共享写半边的输入句柄，不等待响应。
     pub input_sender: InputSender,
+    /// 串行化并发输入：保证偏移分配与帧发送顺序一致。
+    pub input_gate: tokio::sync::Mutex<()>,
+    /// 已发出但未被 InputAck 确认的输入（按偏移）；给 M4 重连重发用。
+    pub input_unacked: Mutex<VecDeque<(u64, Vec<u8>)>>,
 }
+
+/// 未确认输入缓冲上限；超出时丢弃最旧的条目（会在报告里注明）。
+pub const MAX_UNACKED_INPUT_BYTES: usize = 256 * 1024;
 
 impl Session {
     pub fn info(&self) -> SessionMeta {
@@ -77,9 +82,31 @@ impl Session {
     }
 
     pub fn ack_input(&self, next: u64) {
-        let mut acked = self.input_acked.lock().unwrap();
-        if next > *acked {
-            *acked = next;
+        {
+            let mut acked = self.input_acked.lock().unwrap();
+            if next > *acked {
+                *acked = next;
+            }
+        }
+        let mut unacked = self.input_unacked.lock().unwrap();
+        while let Some((offset, bytes)) = unacked.front() {
+            if offset + bytes.len() as u64 <= next {
+                unacked.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn record_input(&self, offset: u64, bytes: &[u8]) {
+        let mut unacked = self.input_unacked.lock().unwrap();
+        unacked.push_back((offset, bytes.to_vec()));
+        let mut total: usize = unacked.iter().map(|(_, bytes)| bytes.len()).sum();
+        while total > MAX_UNACKED_INPUT_BYTES {
+            match unacked.pop_front() {
+                Some((_, dropped)) => total = total.saturating_sub(dropped.len()),
+                None => break,
+            }
         }
     }
 

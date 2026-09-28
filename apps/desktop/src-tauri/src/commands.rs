@@ -7,6 +7,8 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use termbridge::client::{AuthMethod, Client, ClientConfig};
 use termbridge::config::{
@@ -512,6 +514,118 @@ async fn pump_request(session: &Session, req: Request) -> IpcResult<Response> {
     }
 }
 
+/// 发给输出合并任务的前端事件；Output 保留原始字节，在合并任务里统一编码。
+enum FrontEvent {
+    Output {
+        session_id: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    SnapshotBegin(SnapshotBeginEv),
+    SnapshotChunk(SnapshotChunkEv),
+    SnapshotEnd(SnapshotEndEv),
+    Resized(ResizedEv),
+    ControlChanged {
+        session_id: String,
+        controller: Option<String>,
+        is_controller: bool,
+    },
+    InputRejected(InputRejectedEv),
+    Closed(ClosedEv),
+}
+
+/// 输出合并：连续偏移累计到 16ms 空闲或 256 KiB 再 emit，避免事件洪泛。
+async fn output_emitter(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Receiver<FrontEvent>) {
+    const MAX_COALESCE: usize = 256 * 1024;
+    let mut pending: Option<(String, u64, Vec<u8>)> = None;
+    fn flush(app: &tauri::AppHandle, pending: &mut Option<(String, u64, Vec<u8>)>) {
+        if let Some((session_id, offset, data)) = pending.take() {
+            let _ = app.emit(
+                "session_output",
+                OutputEv {
+                    session_id,
+                    offset,
+                    data_b64: B64.encode(&data),
+                },
+            );
+        }
+    }
+    loop {
+        let event = if pending.is_some() {
+            match tokio::time::timeout(std::time::Duration::from_millis(16), rx.recv()).await {
+                Ok(event) => event,
+                Err(_) => {
+                    flush(&app, &mut pending);
+                    continue;
+                }
+            }
+        } else {
+            rx.recv().await
+        };
+        let Some(event) = event else {
+            break;
+        };
+        match event {
+            FrontEvent::Output {
+                session_id,
+                offset,
+                data,
+            } => match &mut pending {
+                Some((sid, base, buf))
+                    if *sid == session_id
+                        && *base + buf.len() as u64 == offset
+                        && buf.len() < MAX_COALESCE =>
+                {
+                    buf.extend_from_slice(&data);
+                }
+                _ => {
+                    flush(&app, &mut pending);
+                    pending = Some((session_id, offset, data));
+                }
+            },
+            other => {
+                flush(&app, &mut pending);
+                match other {
+                    FrontEvent::SnapshotBegin(ev) => {
+                        let _ = app.emit("session_snapshot_begin", ev);
+                    }
+                    FrontEvent::SnapshotChunk(ev) => {
+                        let _ = app.emit("session_snapshot_chunk", ev);
+                    }
+                    FrontEvent::SnapshotEnd(ev) => {
+                        let _ = app.emit("session_snapshot_end", ev);
+                    }
+                    FrontEvent::Resized(ev) => {
+                        let _ = app.emit("session_resized", ev);
+                    }
+                    FrontEvent::ControlChanged {
+                        session_id,
+                        controller,
+                        is_controller,
+                    } => {
+                        let _ = app.emit(
+                            "session_control_changed",
+                            serde_json::json!({
+                                "session_id": session_id,
+                                "controller": controller,
+                                "is_controller": is_controller,
+                            }),
+                        );
+                    }
+                    FrontEvent::InputRejected(ev) => {
+                        let _ = app.emit("session_input_rejected", ev);
+                    }
+                    FrontEvent::Closed(ev) => {
+                        let _ = app.emit("session_closed", ev);
+                    }
+                    FrontEvent::Output { .. } => {}
+                }
+            }
+        }
+    }
+    flush(&app, &mut pending);
+}
+
 fn spawn_pump(
     client: Client,
     app: tauri::AppHandle,
@@ -519,6 +633,8 @@ fn spawn_pump(
     session_id: Uuid,
     rx: tokio::sync::mpsc::Receiver<PumpCmd>,
 ) {
+    let (emit_tx, emit_rx) = tokio::sync::mpsc::channel::<FrontEvent>(256);
+    tauri::async_runtime::spawn(output_emitter(app.clone(), emit_rx));
     tauri::async_runtime::spawn(async move {
         let mut client = client;
         let mut rx = rx;
@@ -529,24 +645,6 @@ fn spawn_pump(
                         let res = client.request(req).await;
                         let _ = resp_tx.send(res.map_err(|e| e.to_string()));
                     }
-                    Some(PumpCmd::Input(data)) => {
-                        // 输入不等待响应；切块并给每块分配连续偏移。
-                        for chunk in data.chunks(MAX_INPUT_CHUNK) {
-                            let offset = session.next_input_offset(chunk.len());
-                            if session
-                                .input_sender
-                                .send_input(session_id, session.stream_id, offset, chunk)
-                                .await
-                                .is_err()
-                            {
-                                session.set_meta(|m| {
-                                    m.online = false;
-                                    m.state = SessionState::Error;
-                                });
-                                break;
-                            }
-                        }
-                    }
                     Some(PumpCmd::Close(ack)) => {
                         let _ = client.disconnect().await;
                         let _ = ack.send(());
@@ -555,16 +653,16 @@ fn spawn_pump(
                     None => break,
                 },
                 ev = client.recv_event() => match ev {
-                    Some(e) => forward_event(&app, &session, &e),
+                    Some(e) => forward_event(&emit_tx, &session, &e).await,
                     None => {
                         session.set_meta(|m| {
                             m.online = false;
                             m.state = SessionState::Error;
                         });
-                        let _ = app.emit("session_closed", ClosedEv {
+                        let _ = emit_tx.send(FrontEvent::Closed(ClosedEv {
                             session_id: session_id.to_string(),
                             reason: Some("connection_lost".into()),
-                        });
+                        })).await;
                         break;
                     }
                 },
@@ -573,59 +671,67 @@ fn spawn_pump(
     });
 }
 
-fn forward_event(app: &tauri::AppHandle, session: &Arc<Session>, event: &Event) {
-    match event {
+async fn forward_event(
+    tx: &tokio::sync::mpsc::Sender<FrontEvent>,
+    session: &Arc<Session>,
+    event: &Event,
+) {
+    let front = match event {
         Event::Output { session_id, offset, data_b64 } => {
-            let _ = app.emit("session_output", OutputEv {
+            let Ok(data) = B64.decode(data_b64) else {
+                return;
+            };
+            FrontEvent::Output {
                 session_id: session_id.to_string(),
                 offset: *offset,
-                data_b64: data_b64.clone(),
-            });
+                data,
+            }
         }
         Event::SnapshotBegin { session_id, offset, rows, cols } => {
-            let _ = app.emit("session_snapshot_begin", SnapshotBeginEv {
+            FrontEvent::SnapshotBegin(SnapshotBeginEv {
                 session_id: session_id.to_string(),
                 offset: *offset,
                 rows: *rows,
                 cols: *cols,
-            });
+            })
         }
         Event::SnapshotChunk { session_id, data_b64 } => {
-            let _ = app.emit("session_snapshot_chunk", SnapshotChunkEv {
+            FrontEvent::SnapshotChunk(SnapshotChunkEv {
                 session_id: session_id.to_string(),
                 data_b64: data_b64.clone(),
-            });
+            })
         }
-        Event::SnapshotEnd { session_id } => {
-            let _ = app.emit("session_snapshot_end", SnapshotEndEv {
-                session_id: session_id.to_string(),
-            });
-        }
+        Event::SnapshotEnd { session_id } => FrontEvent::SnapshotEnd(SnapshotEndEv {
+            session_id: session_id.to_string(),
+        }),
         Event::InputAck { stream_id, offset, .. } => {
             if *stream_id == session.stream_id {
                 session.ack_input(*offset);
             }
+            return;
         }
         Event::InputRejected { session_id, code, message, .. } => {
-            let _ = app.emit("session_input_rejected", InputRejectedEv {
+            FrontEvent::InputRejected(InputRejectedEv {
                 session_id: session_id.to_string(),
                 code: code.clone(),
                 message: message.clone(),
-            });
+            })
         }
-        Event::Resized { session_id, rows, cols } => {
-            let _ = app.emit("session_resized", ResizedEv {
-                session_id: session_id.to_string(),
-                rows: *rows,
-                cols: *cols,
-            });
-        }
+        Event::Resized { session_id, rows, cols } => FrontEvent::Resized(ResizedEv {
+            session_id: session_id.to_string(),
+            rows: *rows,
+            cols: *cols,
+        }),
         Event::Ended { session_id } => {
-            session.set_meta(|m| { m.state = SessionState::Closed; m.online = false; m.is_controller = false; });
-            let _ = app.emit("session_closed", ClosedEv {
+            session.set_meta(|m| {
+                m.state = SessionState::Closed;
+                m.online = false;
+                m.is_controller = false;
+            });
+            FrontEvent::Closed(ClosedEv {
                 session_id: session_id.to_string(),
                 reason: Some("ended".into()),
-            });
+            })
         }
         Event::ControlChanged { session_id, controller } => {
             let mine = session.is_controller(*controller);
@@ -633,13 +739,14 @@ fn forward_event(app: &tauri::AppHandle, session: &Arc<Session>, event: &Event) 
                 meta.controller = controller.map(|c| c.to_string());
                 meta.is_controller = mine;
             });
-            let _ = app.emit("session_control_changed", serde_json::json!({
-                "session_id": session_id.to_string(),
-                "controller": controller.map(|c| c.to_string()),
-                "is_controller": mine,
-            }));
+            FrontEvent::ControlChanged {
+                session_id: session_id.to_string(),
+                controller: controller.map(|c| c.to_string()),
+                is_controller: mine,
+            }
         }
-    }
+    };
+    let _ = tx.send(front).await;
 }
 
 #[tauri::command]
@@ -712,6 +819,8 @@ pub async fn create_session(
     app: tauri::AppHandle,
     profile_id: String,
     password: Option<String>,
+    rows: u16,
+    cols: u16,
 ) -> IpcResult<serde_json::Value> {
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     let uid = Uuid::parse_str(&profile_id).map_err(ipc)?;
@@ -733,8 +842,9 @@ pub async fn create_session(
     let mut client = Client::connect(cfg).await.map_err(ipc)?;
 
     // 创建远端会话（Create 不等于 Attach；attach 由前端显式调用）。
+    // 尺寸来自前端实际 fit 结果，不再写死 24x80。
     let resp = client
-        .request(Request::Create { title: profile.name.clone(), rows: 24, cols: 80 })
+        .request(Request::Create { title: profile.name.clone(), rows, cols })
         .await
         .map_err(ipc)?;
     let remote = match resp {
@@ -762,6 +872,8 @@ pub async fn create_session(
         input_offset: std::sync::Mutex::new(0),
         input_acked: std::sync::Mutex::new(0),
         input_sender: client.input_sender(),
+        input_gate: tokio::sync::Mutex::new(()),
+        input_unacked: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pump(client, app.clone(), session.clone(), session_uuid, rx);
     {
@@ -830,6 +942,8 @@ pub async fn connect_existing_session(
         input_offset: std::sync::Mutex::new(0),
         input_acked: std::sync::Mutex::new(0),
         input_sender: client.input_sender(),
+        input_gate: tokio::sync::Mutex::new(()),
+        input_unacked: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pump(client, app.clone(), session.clone(), sid, rx);
     let state: tauri::State<AppState> = app.state();
@@ -923,21 +1037,60 @@ pub async fn end_session(
     Ok(serde_json::json!(info))
 }
 
-/// 原始终端输入。M1 前端仍用单行输入框，但传输已是按偏移的字节流。
+/// 原始终端输入：直接经 InputSender 发送，不等待响应、不排在 pump 的请求后面。
 #[tauri::command]
-pub fn send_input(app: tauri::AppHandle, session_id: String, data: Vec<u8>) -> IpcResult<()> {
+pub async fn send_input(
+    app: tauri::AppHandle,
+    session_id: String,
+    data: Vec<u8>,
+) -> IpcResult<()> {
     if data.is_empty() {
         return Ok(());
     }
     if data.len() > 64 * MAX_INPUT_CHUNK {
         return Err(ipc("输入超过单次上限"));
     }
+    let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
+    let session = {
+        let state: tauri::State<AppState> = app.state();
+        find_session(&state, &session_id)?
+    };
+    // 串行化并发输入：偏移分配与帧发送必须同序。
+    let _gate = session.input_gate.lock().await;
+    for chunk in data.chunks(MAX_INPUT_CHUNK) {
+        let offset = session.next_input_offset(chunk.len());
+        session
+            .input_sender
+            .send_input(sid, session.stream_id, offset, chunk)
+            .await
+            .map_err(ipc)?;
+        // 记录未确认输入，供重连按偏移重发（M4）。
+        session.record_input(offset, chunk);
+    }
+    Ok(())
+}
+
+/// 控制者设置远端 PTY 尺寸；由前端 fit 结果驱动。
+#[tauri::command]
+pub async fn resize_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    rows: u16,
+    cols: u16,
+) -> IpcResult<()> {
     let state: tauri::State<AppState> = app.state();
     let session = find_session(&state, &session_id)?;
-    session
-        .tx
-        .try_send(PumpCmd::Input(data))
-        .map_err(|_| ipc("会话 pump 已退出或输入队列已满"))
+    let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
+    pump_request(
+        &session,
+        Request::Resize {
+            session_id: sid,
+            rows,
+            cols,
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]

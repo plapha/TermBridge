@@ -73,12 +73,13 @@
           </form>
         </aside>
 
-        <section class="panel panel-terminal" aria-label="终端视窗">
+        <section id="terminal-panel" class="panel panel-terminal" aria-label="终端视窗">
           <div id="terminal-stack" class="terminal-stack"></div>
           <div id="terminal-placeholder" class="terminal-placeholder">
             <p>尚未附加到任何会话。</p>
-            <p class="hint">此视窗为<strong>只读</strong>：键盘输入不会发送到主机。请在下方输入框编写内容并点击“发送”。</p>
+            <p class="hint">终端支持原生交互（Ctrl+C、Tab、方向键等）；只有控制者的输入会发送到主机。</p>
           </div>
+          <div id="terminal-hint" class="terminal-hint hidden" role="status" aria-live="polite"></div>
         </section>
 
         <aside class="panel panel-host" aria-label="主机模式">
@@ -152,23 +153,6 @@
           </div>
         </aside>
       </main>
-
-      <footer class="composer" aria-label="文本输入区">
-        <label for="composer-input">发送内容（仅点击“发送”按钮才会传输到主机）</label>
-        <div class="composer-row">
-          <input
-            id="composer-input"
-            type="text"
-            placeholder="在此编辑单行命令；只有点击右侧按钮才发送"
-            spellcheck="false"
-            autocomplete="off"
-          />
-          <div class="composer-actions">
-            <button id="btn-send" type="button" disabled>发送</button>
-            <span id="composer-target" class="hint">未选择会话</span>
-          </div>
-        </div>
-      </footer>
 
       <div id="fp-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="fp-modal-title">
         <div class="modal-box">

@@ -34,6 +34,7 @@ pub fn run() {
             commands::detach_session,
             commands::end_session,
             commands::send_input,
+            commands::resize_session,
             commands::take_control,
             hide_to_tray
         ])
@@ -70,6 +71,9 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            // F5 / Ctrl+R 等 WebView2 快捷键会刷新整个 GUI，必须屏蔽。
+            #[cfg(windows)]
+            disable_browser_accelerators(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -94,4 +98,28 @@ pub fn run() {
 fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
     let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
     win.hide().map_err(|e| e.to_string())
+}
+
+/// Windows：关闭 WebView2 的浏览器加速键（F5/Ctrl+R/Ctrl+W 等），
+/// 文本编辑键（输入框里的复制粘贴）不受影响。
+#[cfg(windows)]
+fn disable_browser_accelerators(app: &tauri::AppHandle) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows_core::Interface;
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.with_webview(|webview| unsafe {
+        let controller = webview.controller();
+        let Ok(core) = controller.CoreWebView2() else {
+            return;
+        };
+        let Ok(settings) = core.Settings() else {
+            return;
+        };
+        let Ok(settings3) = settings.cast::<ICoreWebView2Settings3>() else {
+            return;
+        };
+        let _ = settings3.SetAreBrowserAcceleratorKeysEnabled(false);
+    });
 }

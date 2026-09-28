@@ -1,6 +1,6 @@
 import "./styles.css";
 import { commands, invoke, listen, backendAvailable, errorText } from "./ipc";
-import { TerminalView } from "./terminal";
+import { TerminalView, measureTerminalSize } from "./terminal";
 import type {
   AttachResult,
   InputRejectedEvent,
@@ -85,11 +85,10 @@ function showBackendRestored(): void {
 }
 
 function setActionsEnabled(enabled: boolean): void {
-  for (const id of ["btn-new-profile", "btn-send", "host-enable", "host-stop", "host-init"]) {
+  for (const id of ["btn-new-profile", "host-enable", "host-stop", "host-init"]) {
     const el = document.getElementById(id) as HTMLButtonElement | null;
     if (el) el.disabled = !enabled;
   }
-  updateSendButton();
 }
 
 function setOfflineBanner(offline: boolean): void {
@@ -121,6 +120,12 @@ async function subscribeEvents(): Promise<void> {
         if (session) {
           session.controller = ev.payload.controller;
           session.is_controller = ev.payload.is_controller;
+          syncControllerState(session.session_id);
+          if (session.is_controller) {
+            const view = terminals.get(session.session_id);
+            view?.fit();
+            void syncResize(session.session_id);
+          }
           renderTabs(); updateTerminalChrome();
         }
       }),
@@ -184,10 +189,53 @@ function ensureTerminal(sessionId: string): TerminalView {
     const container = document.createElement("div");
     container.className = "terminal-instance";
     $("terminal-stack").appendChild(container);
-    view = new TerminalView(sessionId, container);
+    view = new TerminalView(sessionId, container, {
+      onInput: (bytes) => {
+        void commands
+          .sendInput(sessionId, Array.from(bytes))
+          .catch((err) => handleError(err, "输入发送失败"));
+      },
+      onBlockedInput: () => showHint("观察模式：点「接管输入」后可输入。"),
+      onResize: () => void syncResize(sessionId),
+      onClipboardError: () => showHint("无法访问系统剪贴板。"),
+    });
     terminals.set(sessionId, view);
   }
   return view;
+}
+
+let hintTimer: number | undefined;
+
+function showHint(message: string): void {
+  const hint = $("terminal-hint");
+  hint.textContent = message;
+  hint.classList.remove("hidden");
+  if (hintTimer !== undefined) window.clearTimeout(hintTimer);
+  hintTimer = window.setTimeout(() => hint.classList.add("hidden"), 4000);
+}
+
+/** 只有控制者且在线时可输入；其他情况在终端层拦下按键。 */
+function syncControllerState(sessionId: string): void {
+  const s = state.sessions.find((x) => x.session_id === sessionId);
+  const view = terminals.get(sessionId);
+  if (!s || !view) return;
+  const canInput =
+    s.is_controller && s.online && s.state !== "closed" && s.state !== "error";
+  view.setController(canInput);
+}
+
+/** 把当前 fit 尺寸发给远端（仅控制者）。 */
+async function syncResize(sessionId: string): Promise<void> {
+  const s = state.sessions.find((x) => x.session_id === sessionId);
+  const view = terminals.get(sessionId);
+  if (!s?.is_controller || !s.online || !view) return;
+  const { rows, cols } = view.getSize();
+  if (rows < 2 || cols < 2) return;
+  try {
+    await commands.resizeSession(sessionId, rows, cols);
+  } catch (err) {
+    handleError(err, "调整终端尺寸失败");
+  }
 }
 
 function onSnapshotBegin(ev: SnapshotBeginEvent): void {
@@ -200,8 +248,14 @@ function onSnapshotChunk(ev: SnapshotChunkEvent): void {
 }
 
 function onSnapshotEnd(ev: SnapshotEndEvent): void {
-  terminals.get(ev.session_id)?.endSnapshot();
+  const view = terminals.get(ev.session_id);
+  const offset = view?.endSnapshot();
   snapshotPending.delete(ev.session_id);
+  if (view && offset === null) {
+    // 本地积压超限：丢弃缓冲并重新挂接拿快照。
+    void resyncSession(ev.session_id);
+    return;
+  }
   drainBufferedOutput(ev.session_id);
 }
 
@@ -473,7 +527,9 @@ async function connectProfile(p: Profile, existing = false): Promise<void> {
       renderTabs();
       updateTerminalChrome();
     } else {
-      const { session } = await commands.createSession(p.id, password);
+      // 用与终端相同字体测量实际可用行列数，不再写死 24x80。
+      const { rows, cols } = measureTerminalSize($("terminal-panel"));
+      const { session } = await commands.createSession(p.id, password, rows, cols);
       if (rememberNewPassword && password) await rememberPasswordIfAvailable(p.id, password);
       state.sessions.push(session);
       await attachSession(session.session_id);
@@ -493,6 +549,13 @@ function registerAttachedSession(sessionId: string, res: AttachResult): void {
   }
   state.activeSessionId = sessionId;
   activateTerminal(sessionId);
+  // 获得控制权后立即发送一次实际 fit 尺寸。
+  const view = terminals.get(sessionId);
+  if (view && res.session.is_controller) {
+    view.fit();
+    void syncResize(sessionId);
+  }
+  syncControllerState(sessionId);
   renderTabs();
   updateTerminalChrome();
 }
@@ -577,6 +640,10 @@ function renderTabs(): void {
       e.stopPropagation();
       void commands.takeControl(s.session_id).then((res) => {
         state.sessions = state.sessions.map((x) => x.session_id === s.session_id ? res.session : x);
+        const view = terminals.get(s.session_id);
+        syncControllerState(s.session_id);
+        view?.fit();
+        void syncResize(s.session_id);
         renderTabs(); updateTerminalChrome();
       }).catch((err) => handleError(err, "接管输入失败"));
     });
@@ -616,8 +683,8 @@ async function detachCurrent(sessionId: string): Promise<void> {
       $("terminal-stack").classList.remove("active");
       $("terminal-placeholder").classList.remove("hidden");
     }
+    syncControllerState(sessionId);
     renderTabs();
-    updateSendButton();
   } catch (err) {
     handleError(err, "分离会话失败");
   }
@@ -636,7 +703,6 @@ async function endSession(sessionId: string): Promise<void> {
       $("terminal-placeholder").classList.remove("hidden");
     }
     renderTabs();
-    updateSendButton();
   } catch (err) {
     handleError(err, "结束会话失败");
   }
@@ -646,40 +712,11 @@ function currentSession(): SessionInfo | null {
   return state.sessions.find((s) => s.session_id === state.activeSessionId) ?? null;
 }
 
-/** 控制器 / 只读 / 离线状态展示与发送按钮可用性。 */
+/** 控制器 / 只读 / 离线状态展示；输入可用性按会话状态同步到各终端。 */
 function updateTerminalChrome(): void {
   const s = currentSession();
-  const target = $("composer-target");
-  if (!s) {
-    target.textContent = "未选择会话";
-  } else {
-    const role = s.is_controller ? "控制器" : "只读";
-    target.textContent = `${s.profile_name} · ${role}${s.online ? "" : " · 离线，请从“已有终端”重新连接"}`;
-  }
-  updateSendButton();
-}
-
-function updateSendButton(): void {
-  const s = currentSession();
-  const btn = $("btn-send") as HTMLButtonElement;
-  btn.disabled = !backendAvailable || !s || !s.is_controller || !s.online;
-}
-
-/* ---------- 发送 ---------- */
-async function sendComposer(): Promise<void> {
-  const s = currentSession();
-  if (!s || !s.is_controller) return;
-  const input = $("composer-input") as HTMLInputElement;
-  const text = input.value;
-  if (!text) return;
-  try {
-    // v2：传输原始终端字节（Enter = CR），偏移由后端维护。
-    const bytes = new TextEncoder().encode(`${text}\r`);
-    await commands.sendInput(s.session_id, Array.from(bytes));
-    input.value = "";
-  } catch (err) {
-    handleError(err, "发送失败");
-  }
+  for (const id of terminals.keys()) syncControllerState(id);
+  if (s && !s.online) showHint("连接已断开；不会自动重发命令。");
 }
 
 /* ---------- 主机面板 ---------- */
@@ -803,7 +840,7 @@ function wireUi(): void {
     e.preventDefault();
     void saveProfileForm();
   });
-  $("btn-send").addEventListener("click", () => void sendComposer());
+
   $("host-enable").addEventListener("click", () => void setHostEnabled(true));
   $("host-stop").addEventListener("click", () => void setHostEnabled(false));
   $("host-init").addEventListener("click", () => void initHost());
