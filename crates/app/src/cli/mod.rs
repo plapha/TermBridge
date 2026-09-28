@@ -5,15 +5,13 @@
 //! - 密码一律通过 rpassword 读取，不回显、不打印；可选存入系统 keyring。
 //! - 首次连接先用 `client::probe_host` 展示主机指纹，用户显式输入 yes 后
 //!   才写入 known_hosts；之后指纹与记录不一致时直接阻断（client 层强制校验）。
-//! - attach 模式下本地整行编辑、Enter 才发送（v2 的 Input 偏移在此临时维护；
-//!   M3 会替换为 raw 模式）；`:take` / `:detach` / `:end` 为内建命令；
+//! - attach 进入 raw 模式：按键原样透传，Ctrl+] 为本地转义键（见 `raw` 子模块）；
 //!   断线后不再重发任何请求。
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
-use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use termbridge_protocol::{Request, Response};
 
@@ -22,6 +20,8 @@ use crate::config::{
     self, add_public_key, init_host, known_hosts_path, profiles_path, read_json, save_json,
     HostConfig, Profile, Profiles,
 };
+
+mod raw;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:22333";
 const KEYRING_SERVICE: &str = "termbridge";
@@ -145,7 +145,7 @@ pub enum SessionCommand {
         #[arg(long, default_value_t = 80)]
         cols: u16,
     },
-    /// 附加到会话（本地整行编辑，Enter 发送；:take/:detach/:end）
+    /// 附加到会话（raw 模式；Ctrl+] 为本地转义键）
     Attach {
         #[arg(short = 'p', long)]
         profile: String,
@@ -570,6 +570,9 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
             },
         ),
     };
+    if matches!(action, SessionAction::Attach { .. }) && !std::io::stdin().is_terminal() {
+        bail!("session attach 需要真实终端；不支持管道输入");
+    }
     let profile = load_profile(&profile_name)?;
     let mut client = connect_profile(&profile).await.context("连接失败")?;
     let result = match action {
@@ -624,7 +627,7 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
             println!("会话已结束: {session_id}");
             Ok(())
         }
-        SessionAction::Attach { session_id } => attach_loop(&mut client, session_id).await,
+        SessionAction::Attach { session_id } => raw::attach_raw(&mut client, session_id).await,
     };
     client.disconnect().await.ok();
     result
@@ -644,230 +647,4 @@ enum SessionAction {
         session_id: uuid::Uuid,
         take_control: bool,
     },
-}
-
-/// attach 主循环：本地整行编辑，Enter 才发送；`:take`/`:detach`/`:end` 为内建命令；
-/// 远端事件实时显示；断线后不再重发任何请求。
-/// M1 最小适配：输入按 v2 偏移发送，相同 `stream_id` 在重挂时保持不变。
-async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Result<()> {
-    let session_id = match session_id {
-        Some(id) => id,
-        None => {
-            let resp = expect_response(client.request(Request::List).await?, "list")?;
-            let Response::Sessions { sessions } = resp else {
-                bail!("list 返回了意外响应");
-            };
-            sessions
-                .into_iter()
-                .find(|s| s.live)
-                .map(|s| s.id)
-                .context("没有活跃会话，请先用 session create 创建")?
-        }
-    };
-    let stream_id = uuid::Uuid::new_v4();
-    let resp = expect_response(
-        client
-            .request(Request::Attach {
-                session_id,
-                stream_id,
-                input_base: 0,
-                resume_from: None,
-            })
-            .await?,
-        "attach",
-    )?;
-    let Response::Attached {
-        session,
-        has_control,
-        input_next,
-        ..
-    } = resp
-    else {
-        bail!("attach 返回了意外响应");
-    };
-    println!(
-        "已附加到 {}（{}）。输入命令后按 Enter 发送；:take 获取控制权，:detach 脱离，:end 结束会话。",
-        session.id, session.title
-    );
-    if !has_control {
-        println!("当前无控制权，输入 :take 获取。");
-    }
-
-    let mut input_offset = input_next;
-    // 已完整显示到的输出偏移；None 表示正在等待/写入快照。
-    let mut displayed: Option<u64> = None;
-    let mut pending_snapshot: Option<u64> = None;
-
-    // stdin 整行读取放到阻塞线程；回车才产出一条命令。
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(8);
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    if line_tx.blocking_send(l).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    loop {
-        tokio::select! {
-            ev = client.recv_event() => {
-                match ev {
-                    Some(termbridge_protocol::Event::SnapshotBegin { session_id: sid, offset, .. }) if sid == session_id => {
-                        pending_snapshot = Some(offset);
-                        displayed = None;
-                    }
-                    Some(termbridge_protocol::Event::SnapshotChunk { session_id: sid, data_b64 }) if sid == session_id => {
-                        if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
-                            print!("{}", String::from_utf8_lossy(&data));
-                            let _ = std::io::stdout().flush();
-                        }
-                    }
-                    Some(termbridge_protocol::Event::SnapshotEnd { session_id: sid }) if sid == session_id => {
-                        displayed = pending_snapshot.take();
-                    }
-                    Some(termbridge_protocol::Event::Output { session_id: sid, offset, data_b64 }) if sid == session_id => {
-                        match displayed {
-                            None => {}
-                            Some(_) if resync_cli_gap(displayed, offset, &data_b64) => {
-                                println!("\n[检测到输出缺口，重新挂接]");
-                                let (next_input, new_displayed) = resync_cli(
-                                    client,
-                                    session_id,
-                                    stream_id,
-                                    input_offset,
-                                    displayed,
-                                )
-                                .await?;
-                                input_offset = input_offset.max(next_input);
-                                displayed = new_displayed;
-                                pending_snapshot = None;
-                            }
-                            Some(current) => {
-                                if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
-                                    let end = offset + data.len() as u64;
-                                    if end > current {
-                                        let skip = (current - offset) as usize;
-                                        print!("{}", String::from_utf8_lossy(&data[skip..]));
-                                        let _ = std::io::stdout().flush();
-                                        displayed = Some(end);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(termbridge_protocol::Event::InputAck { session_id: sid, stream_id: st, offset: _ }) if sid == session_id && st == stream_id => {}
-                    Some(termbridge_protocol::Event::InputRejected { session_id: sid, stream_id: st, code, message, .. }) if sid == session_id && st == stream_id => {
-                        println!("\n[输入被拒绝: {code} {message}]");
-                    }
-                    Some(termbridge_protocol::Event::Resized { session_id: sid, rows, cols }) if sid == session_id => {
-                        println!("\n[远端尺寸: {cols}x{rows}]");
-                    }
-                    Some(termbridge_protocol::Event::Ended { session_id: sid }) if sid == session_id => {
-                        println!("\n[会话已结束]");
-                        break;
-                    }
-                    Some(termbridge_protocol::Event::ControlChanged { session_id: sid, controller }) if sid == session_id => {
-                        println!("\n[控制权变更: {}]", controller.map(|c| c.to_string()[..8].to_string()).unwrap_or_else(|| "无".into()));
-                    }
-                    Some(_) => {}
-                    None => {
-                        println!("\n[连接已断开，不再重发请求]");
-                        break;
-                    }
-                }
-            }
-            line = line_rx.recv() => {
-                let Some(line) = line else { break };
-                let trimmed = line.trim();
-                match trimmed {
-                    ":detach" => {
-                        match client.request(Request::Detach { session_id }).await {
-                            Ok(resp) => match expect_response(resp, "detach") { Ok(_) => println!("[已脱离]"), Err(e) => println!("[未脱离: {e}]") },
-                            Err(_) => println!("[连接已断开，本地脱离]"),
-                        }
-                        break;
-                    }
-                    ":end" => {
-                        match client.request(Request::End { session_id }).await {
-                            Ok(resp) => match expect_response(resp, "end") { Ok(_) => println!("[会话已结束]"), Err(e) => println!("[未结束: {e}]") },
-                            Err(_) => println!("[连接已断开，未发送 end]"),
-                        }
-                        break;
-                    }
-                    ":take" => {
-                        match client.request(Request::TakeControl { session_id }).await {
-                            Ok(resp) => match expect_response(resp, "take") { Ok(_) => println!("[已获取控制权]"), Err(e) => println!("[未获取: {e}]") },
-                            Err(_) => println!("[连接已断开，不再重发]"),
-                        }
-                    }
-                    "" => {}
-                    _ => {
-                        // 无控制权时不发送，避免误操作。
-                        if client.is_disconnected() {
-                            println!("[连接已断开，不再重发]");
-                            continue;
-                        }
-                        let mut bytes = line.clone().into_bytes();
-                        bytes.push(b'\r');
-                        match client.send_input(session_id, stream_id, input_offset, &bytes).await {
-                            Ok(()) => input_offset += bytes.len() as u64,
-                            Err(_) => println!("[发送状态未知：连接已断开，不再重发]"),
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 输出偏移是否出现缺口（已知已显示偏移 + 事件偏移 + 数据长度）。
-fn resync_cli_gap(displayed: Option<u64>, offset: u64, data_b64: &str) -> bool {
-    let Some(current) = displayed else {
-        return false;
-    };
-    match base64::engine::general_purpose::STANDARD.decode(data_b64) {
-        Ok(_) => offset > current,
-        Err(_) => false,
-    }
-}
-
-/// 重新挂接：优先按 `resume_from` 重放补洞，服务端决定重放还是给快照。
-async fn resync_cli(
-    client: &mut Client,
-    session_id: uuid::Uuid,
-    stream_id: uuid::Uuid,
-    input_base: u64,
-    resume_from: Option<u64>,
-) -> Result<(u64, Option<u64>)> {
-    let resp = expect_response(
-        client
-            .request(Request::Attach {
-                session_id,
-                stream_id,
-                input_base,
-                resume_from,
-            })
-            .await?,
-        "重新挂接",
-    )?;
-    let Response::Attached {
-        resumed,
-        input_next,
-        ..
-    } = resp
-    else {
-        bail!("重新挂接返回了意外响应");
-    };
-    if resumed {
-        Ok((input_next, resume_from))
-    } else {
-        Ok((input_next, None))
-    }
 }
