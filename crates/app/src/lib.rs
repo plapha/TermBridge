@@ -78,6 +78,12 @@ mod tests {
         else {
             panic!("attach rejected")
         };
+        // 同一连接只服务一个通道：多开必须立即被拒绝，不能让客户端挂住。
+        let extra = tokio::time::timeout(Duration::from_secs(5), first.open_extra_channel()).await;
+        assert!(
+            matches!(extra, Ok(Err(_))),
+            "a second channel on one connection was not rejected"
+        );
         #[cfg(windows)]
         let command = "Write-Output TB_INTEGRATION_731";
         #[cfg(not(windows))]

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
@@ -20,6 +20,9 @@ const MAX_ROWS: u16 = 500;
 const MAX_COLS: u16 = 1000;
 const MAX_DEDUP_ENTRIES: usize = 4096;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+/// ConPTY 在创建后立即发出 CSI 6n；只在这段时间内让首次发送等待它。
+#[cfg(windows)]
+const DSR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub struct SessionManager {
     inner: Arc<Inner>,
@@ -169,14 +172,19 @@ impl CommandDedup {
 }
 
 struct Session {
+    id: Uuid,
+    #[cfg(windows)]
+    started: std::time::Instant,
     info: Mutex<SessionInfo>,
     parser: Mutex<vt100::Parser>,
     scrollback: Mutex<Scrollback>,
     seq: AtomicU64,
     attached: Mutex<HashSet<Uuid>>,
     dedup: Mutex<CommandDedup>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    // 进程退出后置为 None：释放 PTY 句柄，Windows 上这会关闭伪控制台，
+    // 让读线程拿到 EOF 退出，会话内存随之释放。
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     events: broadcast::Sender<Event>,
     control: Mutex<TerminalControl>,
@@ -210,6 +218,14 @@ impl Session {
 
     fn broadcast(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    fn close_pty(&self) {
+        // 先从锁里取出再 drop，避免持锁调用可能阻塞的 ClosePseudoConsole。
+        let writer = self.writer.lock().unwrap().take();
+        let master = self.master.lock().unwrap().take();
+        drop(writer);
+        drop(master);
     }
 }
 
@@ -317,14 +333,17 @@ impl SessionManager {
         };
 
         let session = Arc::new(Session {
+            id,
+            #[cfg(windows)]
+            started: std::time::Instant::now(),
             info: Mutex::new(info.clone()),
             parser: Mutex::new(vt100::Parser::new(rows, cols, 0)),
             scrollback: Mutex::new(Scrollback::new()),
             seq: AtomicU64::new(0),
             attached: Mutex::new(HashSet::new()),
             dedup: Mutex::new(CommandDedup::new()),
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
+            writer: Mutex::new(Some(writer)),
+            master: Mutex::new(Some(pair.master)),
             killer: Mutex::new(killer),
             events: events.clone(),
             control: Mutex::new(TerminalControl::default()),
@@ -342,14 +361,22 @@ impl SessionManager {
             let session = Arc::clone(&session);
             std::thread::spawn(move || reader_loop(&session, &mut reader));
         }
-        // Waiter thread: detect child exit, mark dead, broadcast Ended.
+        // Waiter thread: when the shell exits (by itself or via end/shutdown),
+        // broadcast Ended, drop the session from the table and release the PTY.
         {
             let session = Arc::clone(&session);
+            let inner: Weak<Inner> = Arc::downgrade(&self.inner);
             std::thread::spawn(move || {
                 let mut child = child;
                 let _ = child.wait();
-                session.info.lock().unwrap().live = false;
-                session.broadcast(Event::Ended { session_id: id });
+                let was_live = std::mem::replace(&mut session.info.lock().unwrap().live, false);
+                if was_live {
+                    session.broadcast(Event::Ended { session_id: id });
+                }
+                if let Some(inner) = inner.upgrade() {
+                    inner.sessions.lock().unwrap().remove(&id);
+                }
+                session.close_pty();
             });
         }
 
@@ -455,18 +482,34 @@ impl SessionManager {
         // Windows console shells request a cursor-position report (CSI 6n) at
         // startup. Defer that protocol reply until an explicit Send, so a
         // newly attached terminal receives no PTY input before the user acts.
-        let mut control = session.control.lock().unwrap();
-        #[cfg(windows)]
-        if !control.activated && control.pending_dsr.is_none() {
-            let (guard, _) = session
-                .control_ready
-                .wait_timeout(control, std::time::Duration::from_secs(2))
-                .unwrap();
-            control = guard;
-        }
-        control.activated = true;
-        let mut writer = session.writer.lock().unwrap();
-        if let Some(reply) = control.pending_dsr.take() {
+        // Only a Send within DSR_GRACE of creation waits for the request.
+        let pending_dsr = {
+            let mut control = session.control.lock().unwrap();
+            #[cfg(windows)]
+            {
+                let deadline = session.started + DSR_GRACE;
+                while !control.activated && control.pending_dsr.is_none() {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    control = session
+                        .control_ready
+                        .wait_timeout(control, deadline - now)
+                        .unwrap()
+                        .0;
+                }
+            }
+            control.activated = true;
+            control.pending_dsr.take()
+        };
+        // 不持有 control 锁写 PTY：写入若因子进程不读输入而阻塞，
+        // 读线程仍能处理光标查询并继续排空输出。
+        let mut guard = session.writer.lock().unwrap();
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("session is not live"))?;
+        if let Some(reply) = pending_dsr {
             writer.write_all(&reply)?;
         }
         writer.write_all(text_bytes)?;
@@ -483,6 +526,8 @@ impl SessionManager {
             .master
             .lock()
             .unwrap()
+            .as_ref()
+            .ok_or_else(|| anyhow!("session is not live"))?
             .resize(PtySize {
                 rows,
                 cols,
@@ -505,7 +550,10 @@ impl SessionManager {
     pub fn interrupt(&self, session_id: Uuid, client_id: Uuid) -> Result<()> {
         let session = self.get(session_id)?;
         self.require_controller(&session, client_id)?;
-        let mut writer = session.writer.lock().unwrap();
+        let mut guard = session.writer.lock().unwrap();
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("session is not live"))?;
         writer.write_all(b"\x03")?;
         writer.flush()?;
         Ok(())
@@ -519,12 +567,8 @@ impl SessionManager {
 
     pub fn end(&self, session_id: Uuid) -> Result<()> {
         let session = self.get(session_id)?;
-        {
-            let _ = session.killer.lock().unwrap().kill();
-        }
-        session.info.lock().unwrap().live = false;
-        session.broadcast(Event::Ended { session_id });
         self.inner.sessions.lock().unwrap().remove(&session_id);
+        Self::kill(&session);
         Ok(())
     }
 
@@ -535,12 +579,20 @@ impl SessionManager {
             map.drain().map(|(_, s)| s).collect()
         };
         for session in sessions {
-            if let Ok(mut killer) = session.killer.lock() {
-                let _ = killer.kill();
-            }
-            session.info.lock().unwrap().live = false;
-            let id = session.info.lock().unwrap().id;
-            session.broadcast(Event::Ended { session_id: id });
+            Self::kill(&session);
+        }
+    }
+
+    // 标记结束并广播；PTY 由等待线程在进程真正退出后释放。
+    fn kill(session: &Session) {
+        if let Ok(mut killer) = session.killer.lock() {
+            let _ = killer.kill();
+        }
+        let was_live = std::mem::replace(&mut session.info.lock().unwrap().live, false);
+        if was_live {
+            session.broadcast(Event::Ended {
+                session_id: session.id,
+            });
         }
     }
 
@@ -551,7 +603,7 @@ impl SessionManager {
             .unwrap()
             .get(&session_id)
             .map(Arc::clone)
-            .ok_or_else(|| anyhow!("session not found"))
+            .ok_or_else(|| anyhow!("session not found or already ended"))
     }
 
     fn require_controller(&self, session: &Session, client_id: Uuid) -> Result<()> {
@@ -600,21 +652,25 @@ fn reader_loop(session: &Session, reader: &mut dyn std::io::Read) {
                     if tail.iter().copied().eq(b"\x1b[6n".iter().copied()) {
                         let (row, col) = session.parser.lock().unwrap().screen().cursor_position();
                         let reply = format!("\x1b[{};{}R", row + 1, col + 1).into_bytes();
-                        let mut control = session.control.lock().unwrap();
-                        if control.activated {
-                            if let Ok(mut writer) = session.writer.lock() {
+                        let activated = {
+                            let mut control = session.control.lock().unwrap();
+                            if !control.activated {
+                                control.pending_dsr = Some(reply.clone());
+                                session.control_ready.notify_all();
+                            }
+                            control.activated
+                        };
+                        if activated {
+                            if let Some(writer) = session.writer.lock().unwrap().as_mut() {
                                 let _ = writer.write_all(&reply);
                                 let _ = writer.flush();
                             }
-                        } else {
-                            control.pending_dsr = Some(reply);
-                            session.control_ready.notify_all();
                         }
                     }
                 }
                 let data_b64 = B64.encode(&buf[..n]);
                 session.broadcast(Event::Output {
-                    session_id: session.info.lock().unwrap().id,
+                    session_id: session.id,
                     seq,
                     data_b64,
                 });
@@ -622,7 +678,6 @@ fn reader_loop(session: &Session, reader: &mut dyn std::io::Read) {
             Err(_) => break,
         }
     }
-    session.info.lock().unwrap().live = false;
 }
 
 #[cfg(test)]
@@ -725,5 +780,34 @@ mod tests {
         .await;
         assert!(found.is_ok(), "no output after command send");
         mgr.end(info.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_exit_reaps_session() {
+        let mgr = SessionManager::new().unwrap();
+        let info = mgr.create("exit".into(), 24, 80).unwrap();
+        let client = Uuid::new_v4();
+        let mut attachment = mgr.attach(info.id, client).unwrap();
+        mgr.send(info.id, client, Uuid::new_v4(), "exit").unwrap();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match attachment.events.recv().await {
+                    Ok(Event::Ended { session_id }) if session_id == info.id => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("closed without Ended"),
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "no Ended event after the shell exited");
+        // 等待线程先广播再移除，给它一点时间完成。
+        for _ in 0..50 {
+            if mgr.list().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(mgr.list().is_empty(), "exited session still listed");
+        assert!(mgr.attach(info.id, client).is_err());
     }
 }
