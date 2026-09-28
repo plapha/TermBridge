@@ -13,7 +13,7 @@ use termbridge::config::{
     self, host_path, known_hosts_path, profiles_path, read_json, save_json, HostConfig, Profile,
     Profiles,
 };
-use termbridge_protocol::{Event, Request, Response, SessionInfo, MAX_SEND_BYTES};
+use termbridge_protocol::{Event, Request, Response, SessionInfo, MAX_INPUT_CHUNK};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
@@ -140,19 +140,47 @@ pub struct FingerprintDto {
 #[derive(Serialize, Clone)]
 struct OutputEv {
     session_id: String,
-    seq: u64,
+    offset: u64,
     data_b64: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SnapshotBeginEv {
+    session_id: String,
+    offset: u64,
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Serialize, Clone)]
+struct SnapshotChunkEv {
+    session_id: String,
+    data_b64: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SnapshotEndEv {
+    session_id: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ResizedEv {
+    session_id: String,
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Serialize, Clone)]
+struct InputRejectedEv {
+    session_id: String,
+    code: String,
+    message: String,
 }
 
 #[derive(Serialize, Clone)]
 struct ClosedEv {
     session_id: String,
     reason: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct ResyncEv {
-    session_id: String,
 }
 
 fn to_front_info(info: &SessionInfo, meta: &SessionMeta) -> SessionMeta {
@@ -488,7 +516,7 @@ fn spawn_pump(
     client: Client,
     app: tauri::AppHandle,
     session: Arc<Session>,
-    session_id: String,
+    session_id: Uuid,
     rx: tokio::sync::mpsc::Receiver<PumpCmd>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -500,6 +528,24 @@ fn spawn_pump(
                     Some(PumpCmd::Request(req, resp_tx)) => {
                         let res = client.request(req).await;
                         let _ = resp_tx.send(res.map_err(|e| e.to_string()));
+                    }
+                    Some(PumpCmd::Input(data)) => {
+                        // 输入不等待响应；切块并给每块分配连续偏移。
+                        for chunk in data.chunks(MAX_INPUT_CHUNK) {
+                            let offset = session.next_input_offset(chunk.len());
+                            if session
+                                .input_sender
+                                .send_input(session_id, session.stream_id, offset, chunk)
+                                .await
+                                .is_err()
+                            {
+                                session.set_meta(|m| {
+                                    m.online = false;
+                                    m.state = SessionState::Error;
+                                });
+                                break;
+                            }
+                        }
                     }
                     Some(PumpCmd::Close(ack)) => {
                         let _ = client.disconnect().await;
@@ -516,7 +562,7 @@ fn spawn_pump(
                             m.state = SessionState::Error;
                         });
                         let _ = app.emit("session_closed", ClosedEv {
-                            session_id: session_id.clone(),
+                            session_id: session_id.to_string(),
                             reason: Some("connection_lost".into()),
                         });
                         break;
@@ -529,11 +575,49 @@ fn spawn_pump(
 
 fn forward_event(app: &tauri::AppHandle, session: &Arc<Session>, event: &Event) {
     match event {
-        Event::Output { session_id, seq, data_b64 } => {
+        Event::Output { session_id, offset, data_b64 } => {
             let _ = app.emit("session_output", OutputEv {
                 session_id: session_id.to_string(),
-                seq: *seq,
+                offset: *offset,
                 data_b64: data_b64.clone(),
+            });
+        }
+        Event::SnapshotBegin { session_id, offset, rows, cols } => {
+            let _ = app.emit("session_snapshot_begin", SnapshotBeginEv {
+                session_id: session_id.to_string(),
+                offset: *offset,
+                rows: *rows,
+                cols: *cols,
+            });
+        }
+        Event::SnapshotChunk { session_id, data_b64 } => {
+            let _ = app.emit("session_snapshot_chunk", SnapshotChunkEv {
+                session_id: session_id.to_string(),
+                data_b64: data_b64.clone(),
+            });
+        }
+        Event::SnapshotEnd { session_id } => {
+            let _ = app.emit("session_snapshot_end", SnapshotEndEv {
+                session_id: session_id.to_string(),
+            });
+        }
+        Event::InputAck { stream_id, offset, .. } => {
+            if *stream_id == session.stream_id {
+                session.ack_input(*offset);
+            }
+        }
+        Event::InputRejected { session_id, code, message, .. } => {
+            let _ = app.emit("session_input_rejected", InputRejectedEv {
+                session_id: session_id.to_string(),
+                code: code.clone(),
+                message: message.clone(),
+            });
+        }
+        Event::Resized { session_id, rows, cols } => {
+            let _ = app.emit("session_resized", ResizedEv {
+                session_id: session_id.to_string(),
+                rows: *rows,
+                cols: *cols,
             });
         }
         Event::Ended { session_id } => {
@@ -544,21 +628,16 @@ fn forward_event(app: &tauri::AppHandle, session: &Arc<Session>, event: &Event) 
             });
         }
         Event::ControlChanged { session_id, controller } => {
-            let mine = *session.client_id.lock().unwrap();
+            let mine = session.is_controller(*controller);
             session.set_meta(|meta| {
                 meta.controller = controller.map(|c| c.to_string());
-                meta.is_controller = mine.is_some() && *controller == mine;
+                meta.is_controller = mine;
             });
             let _ = app.emit("session_control_changed", serde_json::json!({
                 "session_id": session_id.to_string(),
                 "controller": controller.map(|c| c.to_string()),
-                "is_controller": session.info().is_controller,
+                "is_controller": mine,
             }));
-        }
-        Event::ResyncRequired { session_id } => {
-            let _ = app.emit("session_resync_required", ResyncEv {
-                session_id: session_id.to_string(),
-            });
         }
     }
 }
@@ -674,9 +753,17 @@ pub async fn create_session(
         is_controller: false,
         online: true,
     };
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let session = Arc::new(Session { meta: std::sync::Mutex::new(meta), tx, last_seq: std::sync::Mutex::new(0), client_id: std::sync::Mutex::new(None) });
-    spawn_pump(client, app.clone(), session.clone(), sid.clone(), rx);
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let session_uuid = remote.id;
+    let session = Arc::new(Session {
+        meta: std::sync::Mutex::new(meta),
+        tx,
+        stream_id: Uuid::new_v4(),
+        input_offset: std::sync::Mutex::new(0),
+        input_acked: std::sync::Mutex::new(0),
+        input_sender: client.input_sender(),
+    });
+    spawn_pump(client, app.clone(), session.clone(), session_uuid, rx);
     {
         let state: tauri::State<AppState> = app.state();
         state.sessions.lock().unwrap().insert(sid, session.clone());
@@ -714,9 +801,18 @@ pub async fn connect_existing_session(
     let auth = auth_method(&profile, password)?;
     let mut client = Client::connect(ClientConfig::new(&profile.host, profile.port, &profile.user,
         auth, termbridge::client::HostFingerprint::new(fp))).await.map_err(ipc)?;
-    let result = client.request(Request::Attach { session_id: sid }).await.map_err(ipc)?;
-    let (remote, screen_b64, seq, has_control, client_id) = match result {
-        Response::Attached { session, screen_b64, seq, has_control, client_id } => (session, screen_b64, seq, has_control, client_id),
+    let stream_id = Uuid::new_v4();
+    let result = client
+        .request(Request::Attach {
+            session_id: sid,
+            stream_id,
+            input_base: 0,
+            resume_from: None,
+        })
+        .await
+        .map_err(ipc)?;
+    let (remote, has_control) = match result {
+        Response::Attached { session, has_control, .. } => (session, has_control),
         Response::Error { code, message } => return Err(ipc(format!("{code}: {message}"))),
         _ => return Err(ipc("意外的附着响应")),
     };
@@ -726,37 +822,62 @@ pub async fn connect_existing_session(
         state: SessionState::Attached, controller: remote.controller.map(|c| c.to_string()),
         is_controller: has_control, online: remote.live,
     };
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let session = Arc::new(Session { meta: std::sync::Mutex::new(meta), tx, last_seq: std::sync::Mutex::new(seq), client_id: std::sync::Mutex::new(Some(client_id)) });
-    spawn_pump(client, app.clone(), session.clone(), sid_text.clone(), rx);
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let session = Arc::new(Session {
+        meta: std::sync::Mutex::new(meta),
+        tx,
+        stream_id,
+        input_offset: std::sync::Mutex::new(0),
+        input_acked: std::sync::Mutex::new(0),
+        input_sender: client.input_sender(),
+    });
+    spawn_pump(client, app.clone(), session.clone(), sid, rx);
     let state: tauri::State<AppState> = app.state();
     if let Some(old) = state.sessions.lock().unwrap().insert(sid_text, session.clone()) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let _ = old.tx.try_send(PumpCmd::Close(tx));
     }
-    Ok(serde_json::json!({ "session": to_front_info(&remote, &session.info()), "screen_b64": screen_b64, "seq": seq }))
+    Ok(serde_json::json!({ "session": to_front_info(&remote, &session.info()) }))
 }
 
 #[tauri::command]
 pub async fn attach_session(
     app: tauri::AppHandle,
     session_id: String,
+    resume_from: Option<u64>,
 ) -> IpcResult<serde_json::Value> {
     let state: tauri::State<AppState> = app.state();
     let session = find_session(&state, &session_id)?;
     let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
-    let resp = pump_request(&session, Request::Attach { session_id: sid }).await?;
+    let input_base = *session.input_acked.lock().unwrap();
+    let resp = pump_request(
+        &session,
+        Request::Attach {
+            session_id: sid,
+            stream_id: session.stream_id,
+            input_base,
+            resume_from,
+        },
+    )
+    .await?;
     match resp {
-        Response::Attached { session: remote, screen_b64, seq, has_control, client_id } => {
-            *session.client_id.lock().unwrap() = Some(client_id);
+        Response::Attached {
+            session: remote,
+            has_control,
+            input_next,
+            resumed,
+        } => {
             session.set_meta(|m| {
                 m.state = SessionState::Attached;
                 m.is_controller = has_control;
                 m.online = true;
             });
-            *session.last_seq.lock().unwrap() = seq;
+            let mut offset = session.input_offset.lock().unwrap();
+            if input_next > *offset {
+                *offset = input_next;
+            }
             let info = to_front_info(&remote, &session.info());
-            Ok(serde_json::json!({ "screen_b64": screen_b64, "seq": seq, "session": info }))
+            Ok(serde_json::json!({ "session": info, "resumed": resumed, "input_next": input_next }))
         }
         Response::Error { code, message } => Err(ipc(format!("{code}: {message}"))),
         other => Err(ipc(format!("意外的服务端响应: {other:?}"))),
@@ -802,21 +923,21 @@ pub async fn end_session(
     Ok(serde_json::json!(info))
 }
 
+/// 原始终端输入。M1 前端仍用单行输入框，但传输已是按偏移的字节流。
 #[tauri::command]
-pub async fn send_text(app: tauri::AppHandle, session_id: String, text: String) -> IpcResult<()> {
-    if text.len() > MAX_SEND_BYTES {
-        return Err(ipc(format!("文本超过上限 {MAX_SEND_BYTES} 字节")));
+pub fn send_input(app: tauri::AppHandle, session_id: String, data: Vec<u8>) -> IpcResult<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() > 64 * MAX_INPUT_CHUNK {
+        return Err(ipc("输入超过单次上限"));
     }
     let state: tauri::State<AppState> = app.state();
     let session = find_session(&state, &session_id)?;
-    let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
-    pump_request(&session, Request::Send {
-        session_id: sid,
-        command_id: Uuid::new_v4(),
-        text,
-    })
-    .await
-    .map(|_| ())
+    session
+        .tx
+        .try_send(PumpCmd::Input(data))
+        .map_err(|_| ipc("会话 pump 已退出或输入队列已满"))
 }
 
 #[tauri::command]

@@ -1,14 +1,20 @@
-//! SSH 连接端：连接 TermBridge 服务端（termbridge-v1 subsystem）。
+//! SSH 连接端：连接 TermBridge 服务端（termbridge-v2 subsystem）。
 //!
 //! 不执行任何 shell 命令；所有交互均通过 subsystem 帧协议完成。
 //! 主机指纹校验为严格匹配（SHA256，OpenSSH 格式 `SHA256:<base64>`）。
+//!
+//! 输入与请求分离：[`Client::input_sender`] 返回可克隆的发送句柄，
+//! 可在另一个请求等待响应期间继续发送 `Input` 帧。
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use russh::client::{self, Handle};
 use russh::keys::HashAlg;
 use russh::keys::PublicKeyOrCertificate;
@@ -105,14 +111,63 @@ pub async fn probe_host(host: &str, port: u16) -> Result<HostFingerprint> {
     }
 }
 
+type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+
+/// 只发送 `Input` 帧的句柄；与请求通道共享底层 SSH channel 写半边。
+/// 不等待响应，可在请求等待响应期间并发使用。
+#[derive(Clone)]
+pub struct InputSender {
+    writer: SharedWriter,
+    disconnected: Arc<AtomicBool>,
+}
+
+impl InputSender {
+    pub async fn send_input(
+        &self,
+        session_id: Uuid,
+        stream_id: Uuid,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        if self.disconnected.load(Ordering::SeqCst) {
+            bail!("disconnected");
+        }
+        let frame = Frame::Input {
+            session_id,
+            stream_id,
+            offset,
+            data_b64: B64.encode(data),
+        };
+        let line = encode(&frame).context("encode input failed")?;
+        if line.len() > MAX_FRAME {
+            bail!("input frame too large: {} > {MAX_FRAME}", line.len());
+        }
+        let mut writer = self.writer.lock().await;
+        if let Err(e) = async {
+            writer.write_all(&line).await?;
+            writer.flush().await
+        }
+        .await
+        {
+            self.disconnected.store(true, Ordering::SeqCst);
+            bail!("input delivery uncertain; connection closed: {e}");
+        }
+        Ok(())
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
+    }
+}
+
 /// 请求 ID 到响应的关联由内部事件循环完成；事件异步推送给调用者。
 pub struct Client {
-    writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    sender: InputSender,
     handle: Handle<HostKeyVerifier>,
     loop_rx: mpsc::Receiver<LoopMsg>,
     event_buf: VecDeque<Event>,
     resp_buf: VecDeque<(Uuid, Response)>,
-    disconnected: bool,
+    disconnected: Arc<AtomicBool>,
 }
 
 enum LoopMsg {
@@ -120,6 +175,9 @@ enum LoopMsg {
     Event(Event),
     Closed,
 }
+
+/// 客户端缓存的未消费事件上限；超出时丢弃最旧的。
+const MAX_BUFFERED_EVENTS: usize = 4096;
 
 struct HostKeyVerifier {
     expected: Option<String>,
@@ -162,7 +220,7 @@ fn fingerprint_sha256(key: &russh::keys::PublicKey) -> String {
 }
 
 impl Client {
-    /// 连接并认证，然后打开 termbridge-v1 subsystem。
+    /// 连接并认证，然后打开 termbridge-v2 subsystem。
     pub async fn connect(cfg: ClientConfig) -> Result<Self> {
         let verifier = HostKeyVerifier {
             expected: Some(cfg.expected_fingerprint.sha256.clone()),
@@ -229,19 +287,41 @@ impl Client {
         let (loop_tx, loop_rx) = mpsc::channel(64);
         tokio::spawn(reader_loop(channel, loop_tx));
 
+        let disconnected = Arc::new(AtomicBool::new(false));
         Ok(Self {
-            writer: Box::new(writer),
+            sender: InputSender {
+                writer: Arc::new(tokio::sync::Mutex::new(Box::new(writer))),
+                disconnected: disconnected.clone(),
+            },
             handle,
             loop_rx,
             event_buf: VecDeque::new(),
             resp_buf: VecDeque::new(),
-            disconnected: false,
+            disconnected,
         })
+    }
+
+    /// 可克隆的输入发送句柄；输入不等待响应，也不占用 `&mut Client`。
+    pub fn input_sender(&self) -> InputSender {
+        self.sender.clone()
+    }
+
+    /// 发送一个 `Input` 帧（不等待响应）。ACK/拒绝通过事件返回。
+    pub async fn send_input(
+        &self,
+        session_id: Uuid,
+        stream_id: Uuid,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.sender
+            .send_input(session_id, stream_id, offset, data)
+            .await
     }
 
     /// 发送一个请求并等待按 UUID 关联的响应。单飞（&mut self），不自动重试。
     pub async fn request(&mut self, req: Request) -> Result<Response> {
-        if self.disconnected {
+        if self.is_disconnected() {
             bail!("disconnected");
         }
         let id = Uuid::new_v4();
@@ -249,14 +329,17 @@ impl Client {
         if frame.len() > MAX_FRAME {
             bail!("request too large: {} > {MAX_FRAME}", frame.len());
         }
-        if let Err(e) = async {
-            self.writer.write_all(&frame).await?;
-            self.writer.flush().await
-        }
-        .await
         {
-            self.disconnected = true;
-            bail!("request delivery uncertain; connection closed, never resend automatically: {e}");
+            let mut writer = self.sender.writer.lock().await;
+            if let Err(e) = async {
+                writer.write_all(&frame).await?;
+                writer.flush().await
+            }
+            .await
+            {
+                self.disconnected.store(true, Ordering::SeqCst);
+                bail!("request delivery uncertain; connection closed, never resend automatically: {e}");
+            }
         }
         let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -269,19 +352,10 @@ impl Client {
                         self.resp_buf.push_back((rid, body));
                     }
                     Some(LoopMsg::Event(e)) => {
-                        if self.event_buf.len() >= 1024 {
-                            let session_id = match &e {
-                                Event::Output { session_id, .. }
-                                | Event::Ended { session_id }
-                                | Event::ControlChanged { session_id, .. }
-                                | Event::ResyncRequired { session_id } => *session_id,
-                            };
-                            self.event_buf.clear();
-                            self.event_buf
-                                .push_back(Event::ResyncRequired { session_id });
-                        } else {
-                            self.event_buf.push_back(e);
+                        if self.event_buf.len() >= MAX_BUFFERED_EVENTS {
+                            self.event_buf.pop_front();
                         }
+                        self.event_buf.push_back(e);
                     }
                     Some(LoopMsg::Closed) | None => return None,
                 }
@@ -291,7 +365,7 @@ impl Client {
         match result {
             Ok(Some(response)) => Ok(response),
             _ => {
-                self.disconnected = true;
+                self.disconnected.store(true, Ordering::SeqCst);
                 bail!("request result unknown after timeout/disconnect; never resend automatically")
             }
         }
@@ -307,7 +381,7 @@ impl Client {
                 Some(LoopMsg::Event(e)) => return Some(e),
                 Some(LoopMsg::Response { id, body }) => self.resp_buf.push_back((id, body)),
                 Some(LoopMsg::Closed) | None => {
-                    self.disconnected = true;
+                    self.disconnected.store(true, Ordering::SeqCst);
                     return None;
                 }
             }
@@ -322,12 +396,12 @@ impl Client {
     }
 
     pub fn is_disconnected(&self) -> bool {
-        self.disconnected
+        self.disconnected.load(Ordering::SeqCst)
     }
 
     /// 主动断开并通知。之后 request 会失败，recv_event 返回 None。
     pub async fn disconnect(&mut self) -> Result<()> {
-        self.disconnected = true;
+        self.disconnected.store(true, Ordering::SeqCst);
         self.handle
             .disconnect(Disconnect::ByApplication, "client closed", "en")
             .await
@@ -360,7 +434,7 @@ async fn reader_loop(mut channel: russh::Channel<russh::client::Msg>, tx: mpsc::
                                 return;
                             }
                         }
-                        Ok(Frame::Request { .. }) | Err(_) => {
+                        Ok(_) | Err(_) => {
                             let _ = tx.send(LoopMsg::Closed).await;
                             return;
                         }

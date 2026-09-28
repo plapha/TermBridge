@@ -2,12 +2,18 @@ import "./styles.css";
 import { commands, invoke, listen, backendAvailable, errorText } from "./ipc";
 import { TerminalView } from "./terminal";
 import type {
+  AttachResult,
+  InputRejectedEvent,
   Profile,
   ProfileDraft,
   RemoteSession,
+  ResizedEvent,
   SessionClosedEvent,
   SessionInfo,
   SessionOutputEvent,
+  SnapshotBeginEvent,
+  SnapshotChunkEvent,
+  SnapshotEndEvent,
 } from "./types";
 
 /* ---------- 状态 ---------- */
@@ -21,6 +27,7 @@ const state = {
 const terminals = new Map<string, TerminalView>();
 const snapshotPending = new Set<string>();
 const pendingOutputs = new Map<string, SessionOutputEvent[]>();
+const reattaching = new Set<string>();
 const unlisteners: Array<() => void> = [];
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
@@ -119,10 +126,38 @@ async function subscribeEvents(): Promise<void> {
       }),
     );
     unlisteners.push(
-      await listen("session_resync_required", (raw) => {
-        const ev = raw as { payload?: { session_id?: string } };
-        if (!ev?.payload?.session_id) return;
-        void resyncSession(ev.payload.session_id);
+      await listen("session_snapshot_begin", (raw) => {
+        const ev = raw as { payload?: SnapshotBeginEvent };
+        if (!ev?.payload) return;
+        onSnapshotBegin(ev.payload);
+      }),
+    );
+    unlisteners.push(
+      await listen("session_snapshot_chunk", (raw) => {
+        const ev = raw as { payload?: SnapshotChunkEvent };
+        if (!ev?.payload) return;
+        onSnapshotChunk(ev.payload);
+      }),
+    );
+    unlisteners.push(
+      await listen("session_snapshot_end", (raw) => {
+        const ev = raw as { payload?: SnapshotEndEvent };
+        if (!ev?.payload) return;
+        onSnapshotEnd(ev.payload);
+      }),
+    );
+    unlisteners.push(
+      await listen("session_resized", (raw) => {
+        const ev = raw as { payload?: ResizedEvent };
+        if (!ev?.payload) return;
+        terminals.get(ev.payload.session_id)?.resizeTo(ev.payload.rows, ev.payload.cols);
+      }),
+    );
+    unlisteners.push(
+      await listen("session_input_rejected", (raw) => {
+        const ev = raw as { payload?: InputRejectedEvent };
+        if (!ev?.payload) return;
+        showError(`输入被拒绝（${ev.payload.code}）：${ev.payload.message}`);
       }),
     );
   } catch {
@@ -136,11 +171,38 @@ function onSessionOutput(ev: SessionOutputEvent): void {
   if (!view || snapshotPending.has(ev.session_id)) {
     const queue = pendingOutputs.get(ev.session_id) ?? [];
     queue.push(ev);
-    if (queue.length > 1024) { queue.splice(0, queue.length - 1024); void resyncSession(ev.session_id); }
+    if (queue.length > 2048) queue.splice(0, queue.length - 2048);
     pendingOutputs.set(ev.session_id, queue);
     return;
   }
-  if (!view.applyOutput(ev)) void resyncSession(ev.session_id);
+  if (!view.applyOutput(ev.offset, ev.data_b64)) void resyncSession(ev.session_id);
+}
+
+function ensureTerminal(sessionId: string): TerminalView {
+  let view = terminals.get(sessionId);
+  if (!view) {
+    const container = document.createElement("div");
+    container.className = "terminal-instance";
+    $("terminal-stack").appendChild(container);
+    view = new TerminalView(sessionId, container);
+    terminals.set(sessionId, view);
+  }
+  return view;
+}
+
+function onSnapshotBegin(ev: SnapshotBeginEvent): void {
+  snapshotPending.add(ev.session_id);
+  ensureTerminal(ev.session_id).beginSnapshot(ev.offset, ev.rows, ev.cols);
+}
+
+function onSnapshotChunk(ev: SnapshotChunkEvent): void {
+  terminals.get(ev.session_id)?.snapshotChunk(ev.data_b64);
+}
+
+function onSnapshotEnd(ev: SnapshotEndEvent): void {
+  terminals.get(ev.session_id)?.endSnapshot();
+  snapshotPending.delete(ev.session_id);
+  drainBufferedOutput(ev.session_id);
 }
 
 function onSessionClosed(ev: SessionClosedEvent): void {
@@ -156,27 +218,33 @@ function onSessionClosed(ev: SessionClosedEvent): void {
 }
 
 /**
- * ResyncRequired：服务端输出流丢失序号，前端显式重新 attach，
- * 用 attach 返回的全量 screen_b64 重置画面快照。
+ * 输出出现缺口：重新 attach。
+ * 带 resume_from 时服务端优先从该偏移重放补洞；已越界则回退为快照事件。
  */
 async function resyncSession(sessionId: string): Promise<void> {
-  if (snapshotPending.has(sessionId)) return;
-  snapshotPending.add(sessionId);
+  if (reattaching.has(sessionId) || snapshotPending.has(sessionId)) return;
+  reattaching.add(sessionId);
   setOfflineBanner(true);
   try {
-    const res = await commands.attachSession(sessionId);
+    const view = terminals.get(sessionId);
+    const resumeFrom = view?.getOffset() ?? undefined;
+    if (view) snapshotPending.add(sessionId);
+    const res = await commands.attachSession(sessionId, resumeFrom);
     state.sessions = state.sessions.map((s) =>
       s.session_id === sessionId ? res.session : s,
     );
-    terminals.get(sessionId)?.setScreen(res.screen_b64, res.seq);
-    snapshotPending.delete(sessionId);
-    drainBufferedOutput(sessionId);
+    if (res.resumed) {
+      snapshotPending.delete(sessionId);
+      drainBufferedOutput(sessionId);
+    }
     setOfflineBanner(false);
     renderTabs();
     updateTerminalChrome();
   } catch (err) {
     snapshotPending.delete(sessionId);
     handleError(err, "画面重新同步失败");
+  } finally {
+    reattaching.delete(sessionId);
   }
 }
 
@@ -399,7 +467,11 @@ async function connectProfile(p: Profile, existing = false): Promise<void> {
       catch (err) { snapshotPending.delete(id); throw err; }
       state.sessions = state.sessions.filter((s) => s.session_id !== id);
       state.sessions.push(res.session);
-      showAttachResult(id, res);
+      ensureTerminal(id);
+      state.activeSessionId = id;
+      activateTerminal(id);
+      renderTabs();
+      updateTerminalChrome();
     } else {
       const { session } = await commands.createSession(p.id, password);
       if (rememberNewPassword && password) await rememberPasswordIfAvailable(p.id, password);
@@ -411,20 +483,15 @@ async function connectProfile(p: Profile, existing = false): Promise<void> {
   }
 }
 
-function showAttachResult(sessionId: string, res: {session: SessionInfo; screen_b64: string; seq: number}): void {
+function registerAttachedSession(sessionId: string, res: AttachResult): void {
   state.sessions = state.sessions.map((s) => s.session_id === sessionId ? res.session : s);
-  state.activeSessionId = sessionId;
-  let view = terminals.get(sessionId);
-  if (!view) {
-    const container = document.createElement("div");
-    container.className = "terminal-instance";
-    $("terminal-stack").appendChild(container);
-    view = new TerminalView(sessionId, container);
-    terminals.set(sessionId, view);
+  ensureTerminal(sessionId);
+  if (res.resumed) {
+    // 服务端补发而不是快照：清掉等待标记，事件队列里的输出马上可用。
+    snapshotPending.delete(sessionId);
+    drainBufferedOutput(sessionId);
   }
-  view.setScreen(res.screen_b64, res.seq);
-  snapshotPending.delete(sessionId);
-  drainBufferedOutput(sessionId);
+  state.activeSessionId = sessionId;
   activateTerminal(sessionId);
   renderTabs();
   updateTerminalChrome();
@@ -434,7 +501,7 @@ async function attachSession(sessionId: string): Promise<void> {
   snapshotPending.add(sessionId);
   try {
     const res = await commands.attachSession(sessionId);
-    showAttachResult(sessionId, res);
+    registerAttachedSession(sessionId, res);
   } catch (err) {
     snapshotPending.delete(sessionId);
     handleError(err, "附加会话失败");
@@ -444,10 +511,13 @@ async function attachSession(sessionId: string): Promise<void> {
 function drainBufferedOutput(sessionId: string): void {
   const queue = pendingOutputs.get(sessionId) ?? [];
   pendingOutputs.delete(sessionId);
-  queue.sort((a, b) => a.seq - b.seq);
   const view = terminals.get(sessionId);
+  if (!view) return;
   for (const ev of queue) {
-    if (view && !view.applyOutput(ev)) { void resyncSession(sessionId); break; }
+    if (!view.applyOutput(ev.offset, ev.data_b64)) {
+      void resyncSession(sessionId);
+      break;
+    }
   }
 }
 
@@ -603,7 +673,9 @@ async function sendComposer(): Promise<void> {
   const text = input.value;
   if (!text) return;
   try {
-    await commands.sendText(s.session_id, text);
+    // v2：传输原始终端字节（Enter = CR），偏移由后端维护。
+    const bytes = new TextEncoder().encode(`${text}\r`);
+    await commands.sendInput(s.session_id, Array.from(bytes));
     input.value = "";
   } catch (err) {
     handleError(err, "发送失败");

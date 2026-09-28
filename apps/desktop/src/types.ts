@@ -41,7 +41,7 @@ export interface SessionInfo {
   profile_id: string;
   profile_name: string;
   state: SessionState;
-  /** 当前控制器；为空表示只读或无控制器。 */
+  /** 当前控制者的 stream_id；为空表示只读或无控制器。 */
   controller: string | null;
   /** 本前端实例是否为该会话的控制器。 */
   is_controller: boolean;
@@ -60,11 +60,44 @@ export interface HostStatus {
   port?: number;
 }
 
-/** session_output 事件负载。 */
+/** session_output 事件负载（v2：按输出偏移）。 */
 export interface SessionOutputEvent {
   session_id: string;
-  seq: number;
+  offset: number;
   data_b64: string;
+}
+
+/** session_snapshot_begin 事件负载。 */
+export interface SnapshotBeginEvent {
+  session_id: string;
+  offset: number;
+  rows: number;
+  cols: number;
+}
+
+/** session_snapshot_chunk 事件负载。 */
+export interface SnapshotChunkEvent {
+  session_id: string;
+  data_b64: string;
+}
+
+/** session_snapshot_end 事件负载。 */
+export interface SnapshotEndEvent {
+  session_id: string;
+}
+
+/** session_resized 事件负载。 */
+export interface ResizedEvent {
+  session_id: string;
+  rows: number;
+  cols: number;
+}
+
+/** session_input_rejected 事件负载。 */
+export interface InputRejectedEvent {
+  session_id: string;
+  code: string;
+  message: string;
 }
 
 /** 会话结束 / 断开事件负载（后端可选发布）。 */
@@ -73,11 +106,11 @@ export interface SessionClosedEvent {
   reason: string | null;
 }
 
-/** attach_session 命令的返回：全量画面快照 + 最新序号。 */
+/** attach_session 命令的返回：resumed=true 时输出会从已显示偏移继续补发。 */
 export interface AttachResult {
-  screen_b64: string;
-  seq: number;
   session: SessionInfo;
+  resumed: boolean;
+  input_next: number;
 }
 
 /** create_session 命令的返回。 */
@@ -100,4 +133,9 @@ export type ListenFn = (event: unknown) => void;
 
 export type UnlistenFn = () => void;
 
-export interface RemoteSession { id: string; title: string; live: boolean; controller: string | null; }
+export interface RemoteSession {
+  id: string;
+  title: string;
+  live: boolean;
+  controller: string | null;
+}

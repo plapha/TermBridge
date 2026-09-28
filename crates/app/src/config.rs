@@ -65,9 +65,11 @@ impl HostConfig {
         if user != self.username {
             return false;
         }
+        // 只比较密钥材料：ssh-key 的 PartialEq 会把注释也算进去，
+        // 而 ssh-keygen 生成的 .pub 默认带注释。
         self.authorized_keys.iter().any(|s| {
             PublicKey::from_openssh(s)
-                .map(|k| k == *key)
+                .map(|k| k.key_data() == key.key_data())
                 .unwrap_or(false)
         })
     }
@@ -229,12 +231,13 @@ pub fn parse_authorized_keys(text: &str) -> Result<Vec<String>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let key = PublicKey::from_openssh(line).with_context(|| {
+        let mut key = PublicKey::from_openssh(line).with_context(|| {
             format!(
                 "授权公钥文件第 {} 行不受支持；请移除选项行或提供纯公钥",
                 index + 1
             )
         })?;
+        key.set_comment("");
         let normalized = key.to_openssh()?;
         if !keys.contains(&normalized) {
             keys.push(normalized);
@@ -314,7 +317,8 @@ pub fn switch_to_keys_only(config: &mut HostConfig, text: &str) -> Result<()> {
 }
 
 pub fn add_public_key(config: &mut HostConfig, text: &str) -> Result<()> {
-    let key = PublicKey::from_openssh(text.trim())?;
+    let mut key = PublicKey::from_openssh(text.trim())?;
+    key.set_comment("");
     let normalized = key.to_openssh()?;
     if !config.authorized_keys.contains(&normalized) {
         config.authorized_keys.push(normalized);
@@ -337,5 +341,32 @@ mod ssh_key_tests {
             1
         );
         assert!(parse_authorized_keys(&format!("from=\"192.0.2.1\" {public}")).is_err());
+    }
+
+    #[test]
+    fn keys_with_comments_match_and_are_normalized() {
+        let key = PrivateKey::random(&mut rng(), Algorithm::Ed25519).unwrap();
+        let public = key.public_key().to_openssh().unwrap();
+        let with_comment = format!("{public} user@example");
+        let keys = parse_authorized_keys(&with_comment).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            !keys[0].contains("user@example"),
+            "导入时必须去掉注释：{}",
+            keys[0]
+        );
+        let config = HostConfig {
+            username: "u".into(),
+            authorized_keys: keys,
+            ..Default::default()
+        };
+        assert!(config.verify_key("u", &key.public_key()));
+        // 旧配置里已存的带注释条目也必须继续匹配客户端密钥。
+        let legacy = HostConfig {
+            username: "u".into(),
+            authorized_keys: vec![with_comment],
+            ..Default::default()
+        };
+        assert!(legacy.verify_key("u", &key.public_key()));
     }
 }

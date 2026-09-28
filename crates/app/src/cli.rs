@@ -5,8 +5,9 @@
 //! - 密码一律通过 rpassword 读取，不回显、不打印；可选存入系统 keyring。
 //! - 首次连接先用 `client::probe_host` 展示主机指纹，用户显式输入 yes 后
 //!   才写入 known_hosts；之后指纹与记录不一致时直接阻断（client 层强制校验）。
-//! - attach 模式下本地整行编辑、Enter 才发送；`:take` / `:detach` / `:end`
-//!   为内建命令；断线后不再重发任何请求。
+//! - attach 模式下本地整行编辑、Enter 才发送（v2 的 Input 偏移在此临时维护；
+//!   M3 会替换为 raw 模式）；`:take` / `:detach` / `:end` 为内建命令；
+//!   断线后不再重发任何请求。
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -597,7 +598,14 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
             take_control,
         } => {
             let resp = expect_response(
-                client.request(Request::Attach { session_id }).await?,
+                client
+                    .request(Request::Attach {
+                        session_id,
+                        stream_id: uuid::Uuid::new_v4(),
+                        input_base: 0,
+                        resume_from: None,
+                    })
+                    .await?,
                 "attach",
             )?;
             let Response::Attached { has_control, .. } = resp else {
@@ -640,6 +648,7 @@ enum SessionAction {
 
 /// attach 主循环：本地整行编辑，Enter 才发送；`:take`/`:detach`/`:end` 为内建命令；
 /// 远端事件实时显示；断线后不再重发任何请求。
+/// M1 最小适配：输入按 v2 偏移发送，相同 `stream_id` 在重挂时保持不变。
 async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Result<()> {
     let session_id = match session_id {
         Some(id) => id,
@@ -655,15 +664,22 @@ async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Res
                 .context("没有活跃会话，请先用 session create 创建")?
         }
     };
+    let stream_id = uuid::Uuid::new_v4();
     let resp = expect_response(
-        client.request(Request::Attach { session_id }).await?,
+        client
+            .request(Request::Attach {
+                session_id,
+                stream_id,
+                input_base: 0,
+                resume_from: None,
+            })
+            .await?,
         "attach",
     )?;
     let Response::Attached {
         session,
-        screen_b64,
-        seq,
         has_control,
+        input_next,
         ..
     } = resp
     else {
@@ -676,14 +692,12 @@ async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Res
     if !has_control {
         println!("当前无控制权，输入 :take 获取。");
     }
-    if let Ok(screen) = base64::engine::general_purpose::STANDARD.decode(&screen_b64) {
-        if !screen.is_empty() {
-            print!("{}", String::from_utf8_lossy(&screen));
-            let _ = std::io::stdout().flush();
-        }
-    }
 
-    let mut last_seq = seq;
+    let mut input_offset = input_next;
+    // 已完整显示到的输出偏移；None 表示正在等待/写入快照。
+    let mut displayed: Option<u64> = None;
+    let mut pending_snapshot: Option<u64> = None;
+
     // stdin 整行读取放到阻塞线程；回车才产出一条命令。
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(8);
     std::thread::spawn(move || {
@@ -704,22 +718,55 @@ async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Res
         tokio::select! {
             ev = client.recv_event() => {
                 match ev {
-                    Some(termbridge_protocol::Event::Output { session_id: sid, seq, data_b64 }) if sid == session_id => {
-                        if seq <= last_seq { continue; }
-                        if seq != last_seq + 1 {
-                            println!("\n[检测到输出缺口，重新同步画面]");
-                            last_seq = resync_cli(client, session_id).await?;
-                            continue;
-                        }
-                        last_seq = seq;
+                    Some(termbridge_protocol::Event::SnapshotBegin { session_id: sid, offset, .. }) if sid == session_id => {
+                        pending_snapshot = Some(offset);
+                        displayed = None;
+                    }
+                    Some(termbridge_protocol::Event::SnapshotChunk { session_id: sid, data_b64 }) if sid == session_id => {
                         if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
                             print!("{}", String::from_utf8_lossy(&data));
                             let _ = std::io::stdout().flush();
                         }
                     }
-                    Some(termbridge_protocol::Event::ResyncRequired { session_id: sid }) if sid == session_id => {
-                        println!("\n[输出过快，重新同步画面]");
-                        last_seq = resync_cli(client, session_id).await?;
+                    Some(termbridge_protocol::Event::SnapshotEnd { session_id: sid }) if sid == session_id => {
+                        displayed = pending_snapshot.take();
+                    }
+                    Some(termbridge_protocol::Event::Output { session_id: sid, offset, data_b64 }) if sid == session_id => {
+                        match displayed {
+                            None => {}
+                            Some(_) if resync_cli_gap(displayed, offset, &data_b64) => {
+                                println!("\n[检测到输出缺口，重新挂接]");
+                                let (next_input, new_displayed) = resync_cli(
+                                    client,
+                                    session_id,
+                                    stream_id,
+                                    input_offset,
+                                    displayed,
+                                )
+                                .await?;
+                                input_offset = input_offset.max(next_input);
+                                displayed = new_displayed;
+                                pending_snapshot = None;
+                            }
+                            Some(current) => {
+                                if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                                    let end = offset + data.len() as u64;
+                                    if end > current {
+                                        let skip = (current - offset) as usize;
+                                        print!("{}", String::from_utf8_lossy(&data[skip..]));
+                                        let _ = std::io::stdout().flush();
+                                        displayed = Some(end);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(termbridge_protocol::Event::InputAck { session_id: sid, stream_id: st, offset: _ }) if sid == session_id && st == stream_id => {}
+                    Some(termbridge_protocol::Event::InputRejected { session_id: sid, stream_id: st, code, message, .. }) if sid == session_id && st == stream_id => {
+                        println!("\n[输入被拒绝: {code} {message}]");
+                    }
+                    Some(termbridge_protocol::Event::Resized { session_id: sid, rows, cols }) if sid == session_id => {
+                        println!("\n[远端尺寸: {cols}x{rows}]");
                     }
                     Some(termbridge_protocol::Event::Ended { session_id: sid }) if sid == session_id => {
                         println!("\n[会话已结束]");
@@ -766,9 +813,10 @@ async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Res
                             println!("[连接已断开，不再重发]");
                             continue;
                         }
-                        let cmd_id = uuid::Uuid::new_v4();
-                        match client.request(Request::Send { session_id, command_id: cmd_id, text: line.clone() }).await {
-                            Ok(resp) => if let Err(e) = expect_response(resp, "send") { println!("[发送失败: {e}]"); },
+                        let mut bytes = line.clone().into_bytes();
+                        bytes.push(b'\r');
+                        match client.send_input(session_id, stream_id, input_offset, &bytes).await {
+                            Ok(()) => input_offset += bytes.len() as u64,
                             Err(_) => println!("[发送状态未知：连接已断开，不再重发]"),
                         }
                     }
@@ -779,20 +827,47 @@ async fn attach_loop(client: &mut Client, session_id: Option<uuid::Uuid>) -> Res
     Ok(())
 }
 
-/// 重新附着先获得服务端权威快照；旧输出事件按 seq 丢弃，不重发任何输入。
-async fn resync_cli(client: &mut Client, session_id: uuid::Uuid) -> Result<u64> {
+/// 输出偏移是否出现缺口（已知已显示偏移 + 事件偏移 + 数据长度）。
+fn resync_cli_gap(displayed: Option<u64>, offset: u64, data_b64: &str) -> bool {
+    let Some(current) = displayed else {
+        return false;
+    };
+    match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+        Ok(_) => offset > current,
+        Err(_) => false,
+    }
+}
+
+/// 重新挂接：优先按 `resume_from` 重放补洞，服务端决定重放还是给快照。
+async fn resync_cli(
+    client: &mut Client,
+    session_id: uuid::Uuid,
+    stream_id: uuid::Uuid,
+    input_base: u64,
+    resume_from: Option<u64>,
+) -> Result<(u64, Option<u64>)> {
     let resp = expect_response(
-        client.request(Request::Attach { session_id }).await?,
-        "重新附着",
+        client
+            .request(Request::Attach {
+                session_id,
+                stream_id,
+                input_base,
+                resume_from,
+            })
+            .await?,
+        "重新挂接",
     )?;
     let Response::Attached {
-        screen_b64, seq, ..
+        resumed,
+        input_next,
+        ..
     } = resp
     else {
-        bail!("重新附着返回了意外响应");
+        bail!("重新挂接返回了意外响应");
     };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&screen_b64)?;
-    print!("{}", String::from_utf8_lossy(&bytes));
-    std::io::stdout().flush()?;
-    Ok(seq)
+    if resumed {
+        Ok((input_next, resume_from))
+    } else {
+        Ok((input_next, None))
+    }
 }

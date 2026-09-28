@@ -1,19 +1,24 @@
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import type { SessionOutputEvent } from "./types";
 
 /**
- * 只读终端视窗。
+ * v2 终端视窗：输出按偏移拼接，快照事件重置画面。
  *
- * 安全约束：绝不注册会向主机转发键入的 onData 处理器，
- * xterm 也不获得任何写入主机的通道。主机输出仅经
- * backend → 事件 → term.write 单向进入视窗。
+ * M1 仍不接收键盘输入（M2 打开 disableStdin 并接 onData/FitAddon）；
+ * 本视窗只负责：快照 Begin/Chunk/End、按偏移写入 Output、重复跳过、缺口上报。
  */
 export class TerminalView {
   readonly sessionId: string;
   private term: Terminal;
-  private lastSeq = -1;
   private container: HTMLElement;
+  /** 已显示到的输出偏移；null 表示还没有可用的画面。 */
+  private offset: number | null = null;
+  private snapshot: {
+    offset: number;
+    rows: number;
+    cols: number;
+    chunks: Uint8Array[];
+  } | null = null;
 
   constructor(sessionId: string, container: HTMLElement) {
     this.sessionId = sessionId;
@@ -39,25 +44,51 @@ export class TerminalView {
     if (typeof fit === "function") fit.call(this.term);
   }
 
-  /** 全量画面（attach 返回的 screen_b64）。 */
-  setScreen(screenB64: string, seq: number): void {
-    const bytes = base64ToBytes(screenB64);
+  /** SnapshotBegin：reset 并 resize 到服务端尺寸，等待分块。 */
+  beginSnapshot(offset: number, rows: number, cols: number): void {
+    this.snapshot = { offset, rows, cols, chunks: [] };
+    this.offset = null;
     this.term.reset();
-    this.term.write(bytes);
-    this.lastSeq = seq;
+    this.term.resize(cols, rows);
   }
 
-  /** 增量输出事件；乱序/重复序号被丢弃。 */
-  applyOutput(ev: SessionOutputEvent): boolean {
-    if (ev.session_id !== this.sessionId || ev.seq <= this.lastSeq) return true;
-    if (this.lastSeq >= 0 && ev.seq !== this.lastSeq + 1) return false;
-    this.lastSeq = ev.seq;
-    this.term.write(base64ToBytes(ev.data_b64));
+  snapshotChunk(dataB64: string): void {
+    this.snapshot?.chunks.push(base64ToBytes(dataB64));
+  }
+
+  /** SnapshotEnd：写入所有分块，之后 Output 从快照 offset 继续。 */
+  endSnapshot(): number | null {
+    const snapshot = this.snapshot;
+    if (!snapshot) return this.offset;
+    this.snapshot = null;
+    for (const chunk of snapshot.chunks) this.term.write(chunk);
+    this.offset = snapshot.offset;
+    return this.offset;
+  }
+
+  /**
+   * 增量输出：返回 false 表示出现缺口（调用方应重新挂接补洞）。
+   * 完全重复的字节被跳过。
+   */
+  applyOutput(offset: number, dataB64: string): boolean {
+    if (this.offset === null || this.snapshot) return true;
+    const bytes = base64ToBytes(dataB64);
+    const end = offset + bytes.length;
+    if (end <= this.offset) return true;
+    if (offset > this.offset) return false;
+    const skip = this.offset - offset;
+    this.term.write(bytes.subarray(skip));
+    this.offset = end;
     return true;
   }
 
-  getSeq(): number {
-    return this.lastSeq;
+  getOffset(): number | null {
+    return this.offset;
+  }
+
+  /** 观察者/控制者按会话尺寸显示（3.5）。 */
+  resizeTo(rows: number, cols: number): void {
+    this.term.resize(cols, rows);
   }
 
   dispose(): void {
@@ -66,7 +97,7 @@ export class TerminalView {
   }
 }
 
-/** base64 → UTF-8 字节（终端输出按 UTF-8 解码）。 */
+/** base64 → 原始字节。 */
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);

@@ -1,11 +1,13 @@
 use crate::config::{host_key_path, HostConfig};
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use russh::{
     server::{self, Msg, Server as _, Session},
     Channel, ChannelId, ChannelOpenFailure,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,8 +15,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use termbridge_host::SessionManager;
-use termbridge_protocol::{decode, encode, Event, Frame, Request, Response, MAX_FRAME, SUBSYSTEM};
+use termbridge_host::{Attachment, Chunk, InputOutcome, SessionManager, Subscription};
+use termbridge_protocol::{
+    decode, encode, Event, Frame, Request, Response, MAX_FRAME, MAX_SNAPSHOT_CHUNK, SUBSYSTEM,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -32,8 +36,8 @@ const MAX_PENDING_REQUESTS: usize = 256;
 struct HostServer {
     shared: Arc<Shared>,
     peer: Option<IpAddr>,
-    client_id: Uuid,
     channel: Option<ChannelId>,
+    handle: Option<server::Handle>,
     input: Vec<u8>,
     // subsystem 建立后才有；请求交给连接自己的工作任务按序执行，
     // SSH 回调本身不做任何可能阻塞的事。
@@ -45,8 +49,8 @@ impl HostServer {
         Self {
             shared,
             peer,
-            client_id: Uuid::new_v4(),
             channel: None,
+            handle: None,
             input: Vec::new(),
             requests: None,
         }
@@ -77,13 +81,12 @@ impl HostServer {
 }
 
 /// 一个连接的请求处理者。关闭请求队列后它处理完已排队的请求、
-/// 解除挂接并结束；被丢弃时同样会解除挂接。
+/// 解除挂接并结束；被丢弃时同样会解除挂接（控制权进入宽限期）。
 struct Worker {
     shared: Arc<Shared>,
-    client_id: Uuid,
     channel: ChannelId,
     handle: server::Handle,
-    attached: HashSet<Uuid>,
+    attached: HashMap<Uuid, Uuid>,
     tasks: HashMap<Uuid, tokio::task::JoinHandle<()>>,
 }
 
@@ -101,60 +104,163 @@ impl Worker {
         self.handle.data(self.channel, line).await.map_err(|_| ())
     }
 
-    async fn request(&mut self, id: Uuid, req: Request) -> Result<(), ()> {
-        if self.shared.stopped.load(Ordering::SeqCst) {
-            let body = Response::Error {
-                code: "host_stopped".into(),
-                message: "接收端已停止".into(),
-            };
-            return self.respond(id, body).await;
-        }
-        if let Request::Detach { session_id } = &req {
-            self.attached.remove(session_id);
-            if let Some(task) = self.tasks.remove(session_id) {
-                task.abort();
-            }
-        }
-        // 写终端、启动 shell、等待 ConPTY 光标查询都可能阻塞，放到阻塞线程池。
+    async fn error(&self, id: Uuid, code: &str, message: impl Into<String>) -> Result<(), ()> {
+        self.respond(
+            id,
+            Response::Error {
+                code: code.into(),
+                message: message.into(),
+            },
+        )
+        .await
+    }
+
+    fn stream_for(&self, session_id: Uuid) -> Option<Uuid> {
+        self.attached.get(&session_id).copied()
+    }
+
+    async fn blocking<F>(&self, id: Uuid, f: F) -> Result<(), ()>
+    where
+        F: FnOnce(&SessionManager) -> Result<Response> + Send + 'static,
+    {
         let manager = self.shared.manager.clone();
-        let client_id = self.client_id;
-        let outcome = tokio::task::spawn_blocking(move || execute(&manager, client_id, req))
+        let outcome = tokio::task::spawn_blocking(move || f(&manager))
             .await
-            .unwrap_or_else(|e| (Err(anyhow::anyhow!("请求处理失败：{e}")), None));
-        let (result, forward) = outcome;
-        let body = result.unwrap_or_else(|e| Response::Error {
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("请求处理失败：{e}")));
+        let body = outcome.unwrap_or_else(|e| Response::Error {
             code: "request_failed".into(),
             message: e.to_string(),
         });
-        let attached_id = match &body {
-            Response::Attached { session, .. } => Some(session.id),
-            _ => None,
-        };
-        if let Some(session_id) = attached_id {
-            self.attached.insert(session_id);
+        self.respond(id, body).await
+    }
+
+    async fn request(&mut self, id: Uuid, req: Request) -> Result<(), ()> {
+        if self.shared.stopped.load(Ordering::SeqCst) {
+            return self.error(id, "host_stopped", "接收端已停止").await;
         }
-        // 先发挂接响应，再开始转发事件；期间的事件缓存在 rx 里，不会丢。
-        self.respond(id, body).await?;
-        if let (Some(session_id), Some(rx)) = (attached_id, forward) {
-            if let Some(task) = self.tasks.remove(&session_id) {
-                task.abort();
+        match req {
+            Request::List => {
+                self.blocking(id, |m| Ok(Response::Sessions { sessions: m.list() }))
+                    .await
             }
-            let task = tokio::spawn(forward_events(
-                self.handle.clone(),
-                self.channel,
+            Request::Create { title, rows, cols } => {
+                self.blocking(id, move |m| {
+                    m.create(title, rows, cols)
+                        .map(|session| Response::Created { session })
+                })
+                .await
+            }
+            Request::Attach {
                 session_id,
-                rx,
-            ));
-            self.tasks.insert(session_id, task);
+                stream_id,
+                input_base,
+                resume_from,
+            } => {
+                self.handle_attach(id, session_id, stream_id, input_base, resume_from)
+                    .await
+            }
+            Request::Detach { session_id } => {
+                let Some(stream_id) = self.stream_for(session_id) else {
+                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                };
+                self.attached.remove(&session_id);
+                if let Some(task) = self.tasks.remove(&session_id) {
+                    task.abort();
+                }
+                self.blocking(id, move |m| {
+                    m.detach(session_id, stream_id).map(|_| Response::Accepted)
+                })
+                .await
+            }
+            Request::TakeControl { session_id } => {
+                let Some(stream_id) = self.stream_for(session_id) else {
+                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                };
+                self.blocking(id, move |m| {
+                    m.take_control(session_id, stream_id)
+                        .map(|_| Response::Accepted)
+                })
+                .await
+            }
+            Request::Resize {
+                session_id,
+                rows,
+                cols,
+            } => {
+                let Some(stream_id) = self.stream_for(session_id) else {
+                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                };
+                self.blocking(id, move |m| {
+                    m.resize(session_id, stream_id, rows, cols)
+                        .map(|_| Response::Accepted)
+                })
+                .await
+            }
+            Request::End { session_id } => {
+                let Some(stream_id) = self.stream_for(session_id) else {
+                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                };
+                let result = self
+                    .blocking(id, move |m| {
+                        m.end_for(session_id, stream_id).map(|_| Response::Accepted)
+                    })
+                    .await;
+                if let Some(task) = self.tasks.remove(&session_id) {
+                    task.abort();
+                }
+                self.attached.remove(&session_id);
+                result
+            }
         }
+    }
+
+    async fn handle_attach(
+        &mut self,
+        id: Uuid,
+        session_id: Uuid,
+        stream_id: Uuid,
+        input_base: u64,
+        resume_from: Option<u64>,
+    ) -> Result<(), ()> {
+        let manager = self.shared.manager.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            manager.attach(session_id, stream_id, input_base, resume_from)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("请求处理失败：{e}")));
+        let attachment: Attachment = match outcome {
+            Ok(attachment) => attachment,
+            Err(e) => return self.error(id, "attach_failed", e.to_string()).await,
+        };
+        // 同一连接对同一会话重复挂接：替换旧的转发任务。
+        if let Some(task) = self.tasks.remove(&session_id) {
+            task.abort();
+        }
+        self.attached.insert(session_id, stream_id);
+        let body = Response::Attached {
+            session: attachment.session.clone(),
+            has_control: attachment.has_control,
+            input_next: attachment.input_next,
+            resumed: attachment.resumed,
+        };
+        // 先发挂接响应，再启动转发任务：之后的快照/重放都排在响应之后。
+        self.respond(id, body).await?;
+        let task = tokio::spawn(forward_session(
+            self.handle.clone(),
+            self.channel,
+            session_id,
+            attachment.subscription,
+            attachment.events,
+        ));
+        self.tasks.insert(session_id, task);
         Ok(())
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        for id in self.attached.drain() {
-            let _ = self.shared.manager.detach(id, self.client_id);
+        for (session_id, stream_id) in self.attached.drain() {
+            let _ = self.shared.manager.detach(session_id, stream_id);
         }
         for (_, task) in self.tasks.drain() {
             task.abort();
@@ -162,85 +268,94 @@ impl Drop for Worker {
     }
 }
 
-fn execute(
-    manager: &SessionManager,
-    client_id: Uuid,
-    req: Request,
-) -> (Result<Response>, Option<broadcast::Receiver<Event>>) {
-    let mut forward = None;
-    let result = match req {
-        Request::List => Ok(Response::Sessions {
-            sessions: manager.list(),
-        }),
-        Request::Create { title, rows, cols } => manager
-            .create(title, rows, cols)
-            .map(|session| Response::Created { session }),
-        Request::Attach { session_id } => manager.attach(session_id, client_id).map(|attachment| {
-            forward = Some(attachment.events);
-            Response::Attached {
-                session: attachment.session,
-                screen_b64: attachment.screen_b64,
-                seq: attachment.seq,
-                has_control: attachment.has_control,
-                client_id,
-            }
-        }),
-        Request::Detach { session_id } => manager
-            .detach(session_id, client_id)
-            .map(|_| Response::Accepted),
-        Request::TakeControl { session_id } => manager
-            .take_control(session_id, client_id)
-            .map(|_| Response::Accepted),
-        Request::Send {
-            session_id,
-            command_id,
-            text,
-        } => manager
-            .send(session_id, client_id, command_id, &text)
-            .map(|_| Response::Accepted),
-        Request::Resize {
-            session_id,
-            rows,
-            cols,
-        } => manager
-            .resize(session_id, client_id, rows, cols)
-            .map(|_| Response::Accepted),
-        Request::Interrupt { session_id } => manager
-            .interrupt(session_id, client_id)
-            .map(|_| Response::Accepted),
-        Request::End { session_id } => manager
-            .end_for(session_id, client_id)
-            .map(|_| Response::Accepted),
-    };
-    (result, forward)
+async fn send_event(
+    handle: &server::Handle,
+    channel: ChannelId,
+    event: Event,
+) -> std::result::Result<(), ()> {
+    let line = encode(&Frame::Event { body: event }).map_err(|_| ())?;
+    handle.data(channel, line).await.map_err(|_| ())
 }
 
-async fn forward_events(
+/// 游标式转发：输出走订阅（落后自动快照），控制类事件走 broadcast。
+/// 控制事件先进入本地待发队列、在 select 之外发送，避免取消导致事件丢失。
+async fn forward_session(
     handle: server::Handle,
     channel: ChannelId,
     session_id: Uuid,
-    mut rx: broadcast::Receiver<Event>,
+    mut subscription: Subscription,
+    mut control: broadcast::Receiver<Event>,
 ) {
+    let mut pending: VecDeque<Event> = VecDeque::new();
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let Ok(line) = encode(&Frame::Event { body: event }) else {
-                    break;
-                };
-                if handle.data(channel, line).await.is_err() {
-                    break;
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Clients reattach for an authoritative snapshot after lag.
-                let e = Event::ResyncRequired { session_id };
-                let Ok(line) = encode(&Frame::Event { body: e }) else {
-                    break;
-                };
-                let _ = handle.data(channel, line).await;
+        if let Some(event) = pending.pop_front() {
+            if send_event(&handle, channel, event).await.is_err() {
                 break;
             }
-            Err(_) => break,
+            continue;
+        }
+        loop {
+            match control.try_recv() {
+                Ok(event @ (Event::ControlChanged { .. } | Event::Resized { .. })) => {
+                    pending.push_back(event)
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        if let Some(event) = pending.pop_front() {
+            if send_event(&handle, channel, event).await.is_err() {
+                break;
+            }
+            continue;
+        }
+        tokio::select! {
+            chunk = subscription.next() => match chunk {
+                Chunk::Output { offset, data } => {
+                    let event = Event::Output {
+                        session_id,
+                        offset,
+                        data_b64: B64.encode(&data),
+                    };
+                    if send_event(&handle, channel, event).await.is_err() {
+                        break;
+                    }
+                }
+                Chunk::Snapshot { offset, rows, cols, data } => {
+                    let begin = Event::SnapshotBegin { session_id, offset, rows, cols };
+                    if send_event(&handle, channel, begin).await.is_err() {
+                        break;
+                    }
+                    let mut ok = true;
+                    for part in data.chunks(MAX_SNAPSHOT_CHUNK) {
+                        let frame = Event::SnapshotChunk {
+                            session_id,
+                            data_b64: B64.encode(part),
+                        };
+                        if send_event(&handle, channel, frame).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok || send_event(&handle, channel, Event::SnapshotEnd { session_id }).await.is_err() {
+                        break;
+                    }
+                }
+                Chunk::Ended => {
+                    let _ = send_event(&handle, channel, Event::Ended { session_id }).await;
+                    break;
+                }
+            },
+            event = control.recv() => match event {
+                Ok(event @ (Event::ControlChanged { .. } | Event::Resized { .. })) => {
+                    pending.push_back(event)
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {}
+            },
         }
     }
 }
@@ -319,14 +434,14 @@ impl server::Handler for HostServer {
             let (tx, rx) = mpsc::channel(MAX_PENDING_REQUESTS);
             let worker = Worker {
                 shared: self.shared.clone(),
-                client_id: self.client_id,
                 channel,
                 handle: session.handle(),
-                attached: HashSet::new(),
+                attached: HashMap::new(),
                 tasks: HashMap::new(),
             };
             tokio::spawn(worker.run(rx));
             self.requests = Some(tx);
+            self.handle = Some(session.handle());
             session.channel_success(channel)?;
         } else {
             session.channel_failure(channel)?;
@@ -352,12 +467,67 @@ impl server::Handler for HostServer {
         self.input.extend_from_slice(data);
         while let Some(end) = self.input.iter().position(|&b| b == b'\n') {
             let line: Vec<_> = self.input.drain(..=end).collect();
-            let Ok(Frame::Request { id, body }) = decode(&line) else {
-                return Err(russh::Error::Disconnect);
-            };
-            requests
-                .try_send((id, body))
-                .map_err(|_| russh::Error::Disconnect)?;
+            match decode(&line) {
+                Ok(Frame::Request { id, body }) => {
+                    requests
+                        .try_send((id, body))
+                        .map_err(|_| russh::Error::Disconnect)?;
+                }
+                Ok(Frame::Input {
+                    session_id,
+                    stream_id,
+                    offset,
+                    data_b64,
+                }) => {
+                    // 输入不经过顺序请求队列：校验 + 非阻塞入队，立即回 ACK。
+                    let outcome = match B64.decode(&data_b64) {
+                        Ok(data) => {
+                            if self.shared.stopped.load(Ordering::SeqCst) {
+                                InputOutcome::Rejected {
+                                    code: "host_stopped",
+                                    message: "接收端已停止".into(),
+                                    next: 0,
+                                }
+                            } else {
+                                self.shared
+                                    .manager
+                                    .input(session_id, stream_id, offset, &data)
+                            }
+                        }
+                        Err(_) => InputOutcome::Rejected {
+                            code: "invalid_data",
+                            message: "输入数据不是有效的 base64".into(),
+                            next: 0,
+                        },
+                    };
+                    let event = match outcome {
+                        InputOutcome::Ack { next } => Event::InputAck {
+                            session_id,
+                            stream_id,
+                            offset: next,
+                        },
+                        InputOutcome::Rejected {
+                            code,
+                            message,
+                            next,
+                        } => Event::InputRejected {
+                            session_id,
+                            stream_id,
+                            offset: next,
+                            code: code.into(),
+                            message,
+                        },
+                    };
+                    let line = encode(&Frame::Event { body: event })
+                        .map_err(|_| russh::Error::Disconnect)?;
+                    let handle = self.handle.clone().ok_or(russh::Error::Disconnect)?;
+                    handle
+                        .data(channel, line)
+                        .await
+                        .map_err(|_| russh::Error::Disconnect)?;
+                }
+                Ok(_) | Err(_) => return Err(russh::Error::Disconnect),
+            }
         }
         Ok(())
     }
@@ -367,9 +537,10 @@ impl server::Handler for HostServer {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.channel == Some(channel) {
-            // 关闭队列即通知工作任务收尾并解除挂接。
+            // 关闭队列即通知工作任务收尾并解除挂接（控制权进入宽限期）。
             self.requests = None;
             self.channel = None;
+            self.handle = None;
         }
         Ok(())
     }

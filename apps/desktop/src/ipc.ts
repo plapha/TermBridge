@@ -128,22 +128,26 @@ export const commands = {
   listRemoteSessions: (profileId: string, password?: string) =>
     invoke<RemoteSession[]>("list_remote_sessions", { profile_id: profileId, password: password ?? null }),
   connectExistingSession: (profileId: string, sessionId: string, password?: string) =>
-    invoke<AttachResult>("connect_existing_session", { profile_id: profileId, session_id: sessionId, password: password ?? null }),
+    invoke<CreateSessionResult>("connect_existing_session", { profile_id: profileId, session_id: sessionId, password: password ?? null }),
   /** password 仅为密码认证档案的本次连接密码；不传则由后端回退到凭据库。 */
   createSession: (profileId: string, password?: string) =>
     invoke<CreateSessionResult>("create_session", {
       profile_id: profileId,
       password: password ?? null,
     }),
-  attachSession: (sessionId: string) =>
-    invoke<AttachResult>("attach_session", { session_id: sessionId }),
+  /** resumeFrom：已显示到的输出偏移；服务端优先重放补洞，越界则给快照。 */
+  attachSession: (sessionId: string, resumeFrom?: number | null) =>
+    invoke<AttachResult>("attach_session", {
+      session_id: sessionId,
+      resume_from: resumeFrom ?? null,
+    }),
   detachSession: (sessionId: string) =>
     invoke<SessionInfo>("detach_session", { session_id: sessionId }),
   endSession: (sessionId: string) =>
     invoke<SessionInfo>("end_session", { session_id: sessionId }),
-  /** 仅控制器可用；只读实例会被后端拒绝。 */
-  sendText: (sessionId: string, text: string) =>
-    invoke<void>("send_text", { session_id: sessionId, text }),
+  /** 原始终端输入字节；仅控制器可用，只读实例会被服务端拒绝。 */
+  sendInput: (sessionId: string, data: number[]) =>
+    invoke<void>("send_input", { session_id: sessionId, data }),
   takeControl: (sessionId: string) =>
     invoke<TakeControlResult>("take_control", { session_id: sessionId }),
 };

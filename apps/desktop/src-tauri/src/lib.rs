@@ -33,7 +33,7 @@ pub fn run() {
             commands::attach_session,
             commands::detach_session,
             commands::end_session,
-            commands::send_text,
+            commands::send_input,
             commands::take_control,
             hide_to_tray
         ])
