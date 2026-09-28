@@ -16,6 +16,15 @@
 
 它也不是通用 SSH 客户端或服务端：不能用 TermBridge 连普通的 sshd，也不能用 `ssh` 命令连 TermBridge 的接收端。
 
+## 下载安装
+
+从 [Releases](https://github.com/plapha/TermBridge/releases) 下载：Windows 用 `.exe` 安装包，Debian/Ubuntu 用 `.deb`，macOS 用 `.dmg`（仅 Apple Silicon）。目前只提供 x86_64 的 Windows 和 Linux 版本。
+
+安装包没有代码签名：
+
+- Windows 弹出 SmartScreen 时，点「更多信息」→「仍要运行」。
+- macOS 第一次打开时右键点应用选「打开」；如果提示「已损坏」，执行 `xattr -dr com.apple.quarantine /Applications/TermBridge.app`。
+
 ## 基本概念
 
 | 名称 | 含义 |
@@ -147,6 +156,8 @@ npm run build:windows             # 或 build:linux（deb）、build:macos（dmg
 ```
 
 打包脚本会先用 `scripts/prepare_sidecar.py` 为当前平台编译命令行工具，放进 Tauri 的 sidecar 目录，然后打包。安装包输出在 `apps/desktop/src-tauri/target/release/bundle/`。`.github/workflows/build.yml` 会在三个平台上测试并打包。
+
+发布新版本：先把 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json` 和 `apps/desktop/src-tauri/Cargo.toml` 里的版本号改成一致，然后推送同名标签（例如 `v0.1.2`）。三个平台都构建成功后，CI 会自动创建 Release 并上传安装包；标签和版本号不一致时不会发布。
 
 ## 代码结构
 
