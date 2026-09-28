@@ -314,6 +314,13 @@ impl Client {
         }
     }
 
+    /// 测试用：在同一连接上再开一个通道，验证接收端会立即拒绝。
+    #[cfg(test)]
+    pub(crate) async fn open_extra_channel(&self) -> Result<()> {
+        self.handle.channel_open_session().await?;
+        Ok(())
+    }
+
     pub fn is_disconnected(&self) -> bool {
         self.disconnected
     }
