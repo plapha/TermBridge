@@ -6,7 +6,9 @@
 //!
 //! 终端模式恢复：guard 的 `Drop` + panic hook（正常退出、出错、panic 都恢复）。
 
-use std::io::{IsTerminal, Read, Write};
+#[cfg(not(windows))]
+use std::io::Read;
+use std::io::{IsTerminal, Write};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -354,18 +356,90 @@ impl EscapeFilter {
     }
 }
 
+#[cfg(windows)]
+#[derive(Default)]
+struct Utf16InputDecoder {
+    high: Option<u16>,
+}
+
+#[cfg(windows)]
+impl Utf16InputDecoder {
+    fn decode(&mut self, units: &[u16]) -> Vec<u8> {
+        let mut text = String::new();
+        for &unit in units {
+            if let Some(high) = self.high.take() {
+                if (0xdc00..=0xdfff).contains(&unit) {
+                    let scalar =
+                        0x10000 + (((high as u32 - 0xd800) << 10) | (unit as u32 - 0xdc00));
+                    text.push(char::from_u32(scalar).unwrap());
+                    continue;
+                }
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+            if (0xd800..=0xdbff).contains(&unit) {
+                self.high = Some(unit);
+            } else if (0xdc00..=0xdfff).contains(&unit) {
+                text.push(char::REPLACEMENT_CHARACTER);
+            } else {
+                text.push(char::from_u32(unit as u32).unwrap());
+            }
+        }
+        text.into_bytes()
+    }
+}
+
+/// 直接读控制台 UTF-16（无 Ctrl+Z 唤醒掩码）；std::io::Stdin 会吞尾部 0x1A。
+#[cfg(windows)]
+fn read_console_utf8(
+    decoder: &mut Utf16InputDecoder,
+    buf: &mut [u8; 8192],
+) -> std::io::Result<usize> {
+    use windows_sys::Win32::System::Console::{GetStdHandle, ReadConsoleW, STD_INPUT_HANDLE};
+    let mut wide = [0u16; 2048];
+    let mut count = 0u32;
+    let ok = unsafe {
+        ReadConsoleW(
+            GetStdHandle(STD_INPUT_HANDLE),
+            wide.as_mut_ptr().cast(),
+            wide.len() as u32,
+            &mut count,
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = decoder.decode(&wide[..count as usize]);
+    buf[..bytes.len()].copy_from_slice(&bytes);
+    Ok(bytes.len())
+}
+
 /// stdin 线程：直接读原始字节；仅拦截本地 Ctrl+] 转义。
 fn input_thread(tx: tokio::sync::mpsc::Sender<InputEvent>) {
+    #[cfg(not(windows))]
     let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 4096];
+    #[cfg(windows)]
+    let mut decoder = Utf16InputDecoder::default();
+    let mut buf = [0u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
     let mut filter = EscapeFilter::new();
     loop {
-        match stdin.read(&mut buf) {
+        #[cfg(windows)]
+        let read = read_console_utf8(&mut decoder, &mut buf);
+        #[cfg(not(windows))]
+        let read = stdin.read(&mut buf);
+        match read {
             Ok(0) => {
-                flush_pending(&tx, &mut pending);
-                let _ = tx.blocking_send(InputEvent::Eof);
-                return;
+                #[cfg(windows)]
+                {
+                    continue;
+                } // 不把控制台的零长度读取误判为 Ctrl+Z 后的 EOF。
+                #[cfg(not(windows))]
+                {
+                    flush_pending(&tx, &mut pending);
+                    let _ = tx.blocking_send(InputEvent::Eof);
+                    return;
+                }
             }
             Ok(n) => {
                 for &byte in &buf[..n] {
@@ -557,6 +631,16 @@ fn enable_windows_raw() -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn utf16_stream_handles_split_surrogates_and_ctrl_z() {
+        let mut decoder = Utf16InputDecoder::default();
+        assert_eq!(decoder.decode(&[0xd83d]), b"");
+        assert_eq!(decoder.decode(&[0xde00]), "😀".as_bytes());
+        assert_eq!(decoder.decode(&[0x001a]), b"\x1a");
+        assert_eq!(decoder.decode(&[0xd83d, b'A' as u16]), "�A".as_bytes());
+    }
 
     #[test]
     fn plain_bytes_pass_through() {
