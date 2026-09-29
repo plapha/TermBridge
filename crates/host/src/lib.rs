@@ -413,11 +413,18 @@ pub enum InputOutcome {
 
 /* ---------- Session ---------- */
 
+#[derive(Clone, Copy)]
+struct Dimensions {
+    rows: u16,
+    cols: u16,
+    generation: u64,
+}
+
 struct Session {
     id: Uuid,
     title: Mutex<String>,
     created_unix_ms: u64,
-    dims: Mutex<(u16, u16)>,
+    dims: Mutex<Dimensions>,
     live: AtomicBool,
     state: Mutex<TerminalState>,
     output_signal: watch::Sender<OutputSignal>,
@@ -439,7 +446,7 @@ struct OutputSignal {
 
 impl Session {
     fn info(&self) -> SessionInfo {
-        let (rows, cols) = *self.dims.lock().unwrap();
+        let Dimensions { rows, cols, .. } = *self.dims.lock().unwrap();
         SessionInfo {
             id: self.id,
             title: self.title.lock().unwrap().clone(),
@@ -513,23 +520,40 @@ impl Session {
     }
 
     fn jiggle_resize(&self) {
-        let (rows, cols) = *self.dims.lock().unwrap();
-        if cols <= 2 || !self.live.load(Ordering::SeqCst) {
+        let initial = *self.dims.lock().unwrap();
+        if initial.cols <= 2 || !self.live.load(Ordering::SeqCst) {
             return;
         }
-        if self.resize_pty_only(rows, cols - 1).is_err() {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.parser.screen_mut().set_size(rows, cols - 1);
+        {
+            let dims = self.dims.lock().unwrap();
+            if dims.generation != initial.generation {
+                return;
+            }
+            if self.resize_pty_only(dims.rows, dims.cols - 1).is_err() {
+                return;
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .parser
+                .screen_mut()
+                .set_size(dims.rows, dims.cols - 1);
         }
         std::thread::sleep(Duration::from_millis(120));
-        if self.resize_pty_only(rows, cols).is_err() {
+        let dims = self.dims.lock().unwrap();
+        // 与真实 Resize 同一把锁串行化检查和 PTY/解析器更新，不能覆盖新尺寸。
+        if dims.generation != initial.generation {
             return;
         }
-        if let Ok(mut state) = self.state.lock() {
-            state.parser.screen_mut().set_size(rows, cols);
+        if self.resize_pty_only(dims.rows, dims.cols).is_err() {
+            return;
         }
+        self.state
+            .lock()
+            .unwrap()
+            .parser
+            .screen_mut()
+            .set_size(dims.rows, dims.cols);
     }
 }
 
@@ -803,7 +827,11 @@ impl SessionManager {
             id,
             title: Mutex::new(title),
             created_unix_ms: now_unix_ms(),
-            dims: Mutex::new((rows, cols)),
+            dims: Mutex::new(Dimensions {
+                rows,
+                cols,
+                generation: 0,
+            }),
             live: AtomicBool::new(true),
             state: Mutex::new(TerminalState {
                 parser: vt100::Parser::new(rows, cols, 0),
@@ -1074,8 +1102,11 @@ impl SessionManager {
         validate_dims(rows, cols)?;
         let session = self.get(session_id)?;
         self.require_controller(&session, stream_id)?;
+        let mut dims = session.dims.lock().unwrap();
         session.resize_pty_only(rows, cols)?;
-        *session.dims.lock().unwrap() = (rows, cols);
+        dims.rows = rows;
+        dims.cols = cols;
+        dims.generation = dims.generation.wrapping_add(1);
         session
             .state
             .lock()
@@ -1083,6 +1114,7 @@ impl SessionManager {
             .parser
             .screen_mut()
             .set_size(rows, cols);
+        drop(dims);
         session.broadcast(Event::Resized {
             session_id,
             rows,
@@ -1354,6 +1386,81 @@ mod tests {
         .await
         .unwrap_or(false);
         (found, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    struct MockMaster {
+        size: Arc<Mutex<PtySize>>,
+    }
+
+    impl MasterPty for MockMaster {
+        fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+            *self.size.lock().unwrap() = size;
+            Ok(())
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(*self.size.lock().unwrap())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_during_jiggle_preserves_controller_dimensions() {
+        let mgr = SessionManager::new().unwrap();
+        let fake = fake_session(&mgr);
+        let size = Arc::new(Mutex::new(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        *fake.session.master.lock().unwrap() = Some(Box::new(MockMaster { size: size.clone() }));
+        fake.feed.send(b"\x1b[?1049h".to_vec()).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || fake
+            .session
+            .state
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .alternate_screen()));
+        let stream = Uuid::new_v4();
+        assert!(
+            mgr.attach(fake.session.id, stream, 0, None)
+                .unwrap()
+                .has_control
+        );
+        assert!(wait_until(Duration::from_secs(2), || size
+            .lock()
+            .unwrap()
+            .cols
+            == 79));
+        mgr.resize(fake.session.id, stream, 30, 100).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let dims = *fake.session.dims.lock().unwrap();
+        assert_eq!((dims.rows, dims.cols), (30, 100));
+        assert_eq!(
+            fake.session.state.lock().unwrap().parser.screen().size(),
+            (30, 100)
+        );
+        let actual = *size.lock().unwrap();
+        assert_eq!((actual.rows, actual.cols), (30, 100));
     }
 
     #[tokio::test]
