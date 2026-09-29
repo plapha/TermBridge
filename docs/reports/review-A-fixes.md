@@ -1,6 +1,6 @@
 # 复核点 A 修复报告
 
-日期：2026-09-29。分支：`v2/review-a`（基于 `v2/m3-cli-raw`）。只在本地提交，未推送，未做 M4 重连逻辑。
+日期：2026-09-29。分支：`v2/review-a`（基于 `v2/m3-cli-raw`）。开发代理只在本地提交；负责人复核后推送。未做 M4 重连逻辑。
 
 ## 1. 逐项核实、修复与测试
 
@@ -41,7 +41,9 @@
 
 `npm --prefix apps/desktop run build`：退出码 **0**，`tsc --noEmit && vite build`，`17 modules transformed`，`built in 557ms`。这只是本机 Windows 检查/构建，不代表三平台 CI。
 
-**CI：待推送**（遵照负责人本次要求，不执行 `git push`；没有新分支 run 链接）。
+**CI（负责人推送后补记）**：
+- 52ab4b3（全部修复 + 本报告）：[run 36535025097](https://github.com/plapha/TermBridge/actions/runs/36535025097) —— Windows / Ubuntu 24.04 / macOS 三个 build job 均 success（每个 job 含 `cargo test --workspace` 与桌面安装包构建）。
+- 9e1eb5d（A4 补丁，见第 6 节）：[run 36535579164](https://github.com/plapha/TermBridge/actions/runs/36535579164) —— 三平台均 success。
 
 ## 4. 人工验收矩阵
 
@@ -64,6 +66,15 @@
 
 ## 5. 待复核与已知风险
 
-- 负责人推送后需核对 Windows/Linux/macOS 的测试和桌面构建；目前不能声称三平台全绿。
 - D6 保留为已知问题。A3/B2/C1 及 D1/D3/D4 的真实桌面行为仍待人工验收。
 - C2 的 GUI 溢出恢复会使用完整快照（较重但安全）；M4 的跨连接自动重连逻辑未实施。
+## 6. 负责人复核记录
+
+逐个提交读过 diff（A1–A4、B1–B4、C1–C3、D），结论：通过，可以从 `v2/review-a` 开 M4。
+
+- 追加提交 9e1eb5d：`SessionManager::with_control_grace` 里 `SetConsoleCtrlHandler(None, 0)` 失败原先返回错误，改为打印警告后继续——它只影响 Ctrl+C 继承，不应让无控制台的接收端（服务 / 计划任务）直接启动失败。
+- C2：已核对服务端 `handle_attach` 先中止旧转发任务、再发 `Attached`、再启动新转发任务，因此客户端在收到 `Attached` 时清空事件缓冲是安全的；GUI 每个会话一个 `Client`，清空不会误伤其他会话。
+- 留给 M4 的注意点（非阻塞）：
+  1. GUI 的 busy 重发在 pump 里持有 `input_gate` 睡 50 ms，期间新按键排队等待；M4 做重连时可改为不持锁退避。
+  2. B4 的令牌只约束 detach；同一 `stream_id` 的旧连接在断开前仍能发 Input（报告第 2 节已记），M4 需要按连接或令牌鉴权输入。
+  3. D6 保持为已知问题。
