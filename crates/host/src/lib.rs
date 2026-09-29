@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -440,6 +442,9 @@ struct Session {
     pty_writer: Mutex<Option<Box<dyn Write + Send>>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
+    /// shell 的 pid，同时也是它作为 session leader 所在会话的 sid（0 表示未知）。
+    #[cfg(unix)]
+    shell_pid: AtomicI32,
     control: Mutex<ControlState>,
     events: broadcast::Sender<Event>,
 }
@@ -800,6 +805,10 @@ impl SessionManager {
             Some(pair.master),
             Some(killer),
         );
+        #[cfg(unix)]
+        if let Some(pid) = child.process_id() {
+            session.shell_pid.store(pid as i32, Ordering::SeqCst);
+        }
         let id = session.id;
         let inner = Arc::downgrade(&self.inner);
         // 进程退出后释放 PTY；读线程排空剩余输出后自行广播 Ended。
@@ -856,6 +865,8 @@ impl SessionManager {
             pty_writer: Mutex::new(Some(writer)),
             master: Mutex::new(master),
             killer: Mutex::new(killer),
+            #[cfg(unix)]
+            shell_pid: AtomicI32::new(0),
             control: Mutex::new(ControlState::default()),
             events,
         });
@@ -1167,6 +1178,14 @@ impl SessionManager {
     }
 
     fn kill(session: &Session) {
+        // 只在 shell 尚未被回收时按 sid 清理，避免 sid 被系统复用后误伤无关进程。
+        #[cfg(unix)]
+        if session.live.load(Ordering::SeqCst) {
+            let sid = session.shell_pid.load(Ordering::SeqCst);
+            if sid > 0 {
+                session_kill::terminate(sid);
+            }
+        }
         if let Some(killer) = session.killer.lock().unwrap().as_mut() {
             let _ = killer.kill();
         }
@@ -1208,6 +1227,92 @@ pub struct Attachment {
     pub token: u64,
     pub subscription: Subscription,
     pub events: broadcast::Receiver<Event>,
+}
+
+/// Unix 上结束会话时清理整个会话：shell 是 session leader，
+/// 它启动的前台/后台任务（包括 `nohup`、忽略 SIGHUP 的进程）都属于同一个 sid。
+/// 主动 `setsid` 脱离的守护进程不在其中，与普通终端的行为一致。
+#[cfg(unix)]
+mod session_kill {
+    use std::time::Duration;
+
+    /// SIGHUP 之后给进程处理收尾的时间，超时仍存活的再 SIGKILL。
+    const GRACE: Duration = Duration::from_millis(300);
+    const KILL_POLL: Duration = Duration::from_millis(50);
+    const KILL_ROUNDS: usize = 20;
+
+    #[cfg(target_os = "linux")]
+    fn list_pids() -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .map(|dir| {
+                dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn list_pids() -> Vec<i32> {
+        // SAFETY: 第一次调用只查询数量；第二次传入的缓冲区大小与实际分配一致。
+        unsafe {
+            let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+            if count <= 0 {
+                return Vec::new();
+            }
+            let mut pids = vec![0i32; count as usize + 64];
+            let filled = libc::proc_listallpids(
+                pids.as_mut_ptr().cast(),
+                (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+            );
+            pids.truncate(filled.max(0) as usize);
+            pids.retain(|pid| *pid > 0);
+            pids
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn list_pids() -> Vec<i32> {
+        Vec::new()
+    }
+
+    /// 属于会话 `sid` 的全部进程。
+    fn members(sid: i32) -> Vec<i32> {
+        list_pids()
+            .into_iter()
+            // SAFETY: getsid 只读取进程信息。
+            .filter(|pid| unsafe { libc::getsid(*pid) } == sid)
+            .collect()
+    }
+
+    fn signal_all(sid: i32, pids: &[i32], signal: libc::c_int) {
+        // SAFETY: 向已确认属于该会话的进程发信号。
+        unsafe {
+            // 无法枚举进程的平台上，至少覆盖 shell 自己的进程组。
+            libc::killpg(sid, signal);
+            for pid in pids {
+                libc::kill(*pid, signal);
+            }
+        }
+    }
+
+    pub(super) fn terminate(sid: i32) {
+        let pids = members(sid);
+        signal_all(sid, &pids, libc::SIGHUP);
+        // 被挂起的任务要先继续运行才能处理信号。
+        signal_all(sid, &pids, libc::SIGCONT);
+        // 不阻塞调用者（可能在异步运行时的工作线程上）：宽限期后在后台补 SIGKILL。
+        std::thread::spawn(move || {
+            std::thread::sleep(GRACE);
+            for _ in 0..KILL_ROUNDS {
+                let pids = members(sid);
+                if pids.is_empty() {
+                    return;
+                }
+                signal_all(sid, &pids, libc::SIGKILL);
+                std::thread::sleep(KILL_POLL);
+            }
+        });
+    }
 }
 
 fn writer_loop(session: &Session) {
@@ -1994,5 +2099,95 @@ mod tests {
         assert!(ended.is_ok(), "no Ended after the shell exited");
         assert!(wait_until(Duration::from_secs(5), || mgr.list().is_empty()));
         assert!(mgr.attach(info.id, stream, 0, None).is_err());
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn spawn_background_sleep(mgr: &SessionManager, info: &SessionInfo, launch: &str) -> i32 {
+        let marker = "TB_BG";
+        let session = mgr.get(info.id).unwrap();
+        wait_shell_ready(&session);
+        let stream = Uuid::new_v4();
+        let mut subscription = mgr.attach(info.id, stream, 0, None).unwrap().subscription;
+        // 命令行回显里标记后面是 `$!`，只有执行结果里标记后面才是数字。
+        let command = format!("{launch}; echo {marker}_$!\r");
+        assert!(matches!(
+            mgr.input(info.id, stream, 0, command.as_bytes()),
+            InputOutcome::Ack { .. }
+        ));
+        let prefix = format!("{marker}_");
+        let pid = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut out = String::new();
+            loop {
+                match subscription.next().await {
+                    Chunk::Output { data, .. } | Chunk::Snapshot { data, .. } => {
+                        out.push_str(&String::from_utf8_lossy(&data));
+                        let digits: String = out
+                            .split(&prefix)
+                            .skip(1)
+                            .filter_map(|rest| {
+                                let d: String =
+                                    rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                                // 数字后面必须已经有换行，避免读到被截断的 pid。
+                                (!d.is_empty() && rest[d.len()..].starts_with(['\r', '\n']))
+                                    .then_some(d)
+                            })
+                            .next()
+                            .unwrap_or_default();
+                        if !digits.is_empty() {
+                            break digits;
+                        }
+                    }
+                    Chunk::Ended => panic!("session ended before background pid was printed"),
+                }
+            }
+        })
+        .await
+        .expect("background pid was not printed");
+        let pid: i32 = pid.parse().unwrap();
+        assert!(pid_alive(pid), "background job {pid} is not running");
+        pid
+    }
+
+    /// 后台任务的几种启动方式：普通 `&`（shell 退出时会转发 SIGHUP）、
+    /// `nohup`、显式忽略 SIGHUP 的进程。后两者不会被 SIGHUP 带走。
+    #[cfg(unix)]
+    const BACKGROUND_LAUNCHES: [&str; 3] = [
+        "sleep 300 &",
+        "nohup sleep 300 >/dev/null 2>&1 &",
+        "sh -c 'trap \"\" HUP; exec sleep 300' &",
+    ];
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn end_session_kills_background_jobs() {
+        for launch in BACKGROUND_LAUNCHES {
+            let mgr = SessionManager::new().unwrap();
+            let info = mgr.create("bg".into(), 24, 80).unwrap();
+            let pid = spawn_background_sleep(&mgr, &info, launch).await;
+            mgr.end(info.id).unwrap();
+            assert!(
+                wait_until(Duration::from_secs(10), || !pid_alive(pid)),
+                "background job {pid} started with `{launch}` survived end()"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_background_jobs() {
+        let mgr = SessionManager::new().unwrap();
+        let info = mgr.create("bg".into(), 24, 80).unwrap();
+        let pid = spawn_background_sleep(&mgr, &info, BACKGROUND_LAUNCHES[1]).await;
+        mgr.shutdown();
+        assert!(
+            wait_until(Duration::from_secs(10), || !pid_alive(pid)),
+            "nohup job {pid} survived shutdown()"
+        );
     }
 }
