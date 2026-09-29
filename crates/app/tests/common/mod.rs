@@ -43,7 +43,7 @@ pub async fn read_snapshot(client: &mut client::Client, session_id: Uuid) -> (u6
     let mut offset = None;
     let mut data: Vec<u8> = Vec::new();
     loop {
-        match client.recv_event().await {
+        match client.recv_event().await.expect("unexpected event loss") {
             Some(Event::SnapshotBegin {
                 session_id: sid,
                 offset: o,
@@ -123,7 +123,7 @@ pub async fn drain_until(
 ) -> bool {
     tokio::time::timeout(timeout, async {
         loop {
-            match client.recv_event().await {
+            match client.recv_event().await.expect("unexpected event loss") {
                 Some(Event::Output {
                     session_id: sid,
                     offset,
@@ -159,7 +159,7 @@ pub async fn drain_until_answering(
     let mut responder = QueryResponder::new();
     tokio::time::timeout(timeout, async {
         loop {
-            match client.recv_event().await {
+            match client.recv_event().await.expect("unexpected event loss") {
                 Some(Event::Output {
                     session_id: sid,
                     offset,
@@ -188,4 +188,3 @@ pub async fn drain_until_answering(
     .await
     .unwrap_or(false)
 }
-

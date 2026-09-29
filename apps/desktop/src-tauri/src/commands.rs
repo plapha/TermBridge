@@ -684,8 +684,29 @@ fn spawn_pump(
                     None => break,
                 },
                 ev = client.recv_event() => match ev {
-                    Some(e) => forward_event(&emit_tx, &session, &mut client, &e).await,
-                    None => {
+                    Ok(Some(e)) => forward_event(&emit_tx, &session, &mut client, &e).await,
+                    Err(_) => {
+                        // 前端实际已绘制的偏移无法由后端证明；全量快照比猜测 resume_from 安全。
+                        let base = session.input_buffer.lock().unwrap().acked();
+                        match client.request(Request::Attach {
+                            session_id, stream_id: session.stream_id,
+                            input_base: base, resume_from: None,
+                        }).await {
+                            Ok(Response::Attached { input_next, has_control, .. }) => {
+                                session.input_buffer.lock().unwrap().align_attach(input_next);
+                                session.set_meta(|m| m.is_controller = has_control);
+                            }
+                            _ => {
+                                session.set_meta(|m| m.state = SessionState::Error);
+                                let _ = emit_tx.send(FrontEvent::Closed(ClosedEv {
+                                    session_id: session_id.to_string(),
+                                    reason: Some("event_loss_reattach_failed".into()),
+                                })).await;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
                         session.set_meta(|m| {
                             m.online = false;
                             m.state = SessionState::Error;

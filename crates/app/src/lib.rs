@@ -53,7 +53,7 @@ mod tests {
         let mut offset = None;
         let mut data: Vec<u8> = Vec::new();
         loop {
-            match client.recv_event().await {
+            match client.recv_event().await.expect("unexpected event loss") {
                 Some(Event::SnapshotBegin {
                     session_id: sid,
                     offset: o,
@@ -133,7 +133,7 @@ mod tests {
     ) -> bool {
         tokio::time::timeout(timeout, async {
             loop {
-                match client.recv_event().await {
+                match client.recv_event().await.expect("unexpected event loss") {
                     Some(Event::Output {
                         session_id: sid,
                         offset,
@@ -169,7 +169,7 @@ mod tests {
         let mut responder = QueryResponder::new();
         tokio::time::timeout(timeout, async {
             loop {
-                match client.recv_event().await {
+                match client.recv_event().await.expect("unexpected event loss") {
                     Some(Event::Output {
                         session_id: sid,
                         offset,
@@ -303,7 +303,7 @@ mod tests {
         let mut acked = false;
         let received = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                match first.recv_event().await {
+                match first.recv_event().await.expect("unexpected event loss") {
                     Some(Event::InputAck {
                         session_id: sid,
                         stream_id: st,
@@ -582,7 +582,7 @@ mod tests {
         let mut responder = QueryResponder::new();
         tokio::time::timeout(Duration::from_secs(5), async {
             while outputs < 10 {
-                match client.recv_event().await {
+                match client.recv_event().await.expect("unexpected event loss") {
                     Some(Event::Output {
                         session_id,
                         data_b64,
@@ -612,7 +612,7 @@ mod tests {
             next += 1;
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    match client.recv_event().await {
+                    match client.recv_event().await.expect("unexpected event loss") {
                         Some(Event::InputAck {
                             session_id,
                             stream_id,
@@ -712,7 +712,7 @@ mod tests {
         second.send_input(sid, observer, 0, b"nope").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match second.recv_event().await {
+                match second.recv_event().await.expect("unexpected event loss") {
                     Some(Event::InputRejected {
                         session_id,
                         stream_id,
@@ -838,7 +838,7 @@ mod tests {
         second.send_input(sid, stream1, 0, b"x").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match second.recv_event().await {
+                match second.recv_event().await.expect("unexpected event loss") {
                     Some(Event::InputAck {
                         session_id,
                         stream_id,
@@ -867,7 +867,7 @@ mod tests {
         second.send_input(sid, stream1, 1, b"y").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match second.recv_event().await {
+                match second.recv_event().await.expect("unexpected event loss") {
                     Some(Event::InputRejected {
                         session_id,
                         stream_id,
@@ -900,7 +900,7 @@ mod tests {
         second.send_input(sid, stream2, 0, b"z").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match second.recv_event().await {
+                match second.recv_event().await.expect("unexpected event loss") {
                     Some(Event::InputAck {
                         session_id,
                         stream_id,

@@ -337,7 +337,7 @@ pub struct Client {
     sender: InputSender,
     handle: Handle<HostKeyVerifier>,
     loop_rx: mpsc::Receiver<LoopMsg>,
-    event_buf: VecDeque<Event>,
+    event_buf: EventBuffer,
     resp_buf: VecDeque<(Uuid, Response)>,
     disconnected: Arc<AtomicBool>,
 }
@@ -350,6 +350,62 @@ enum LoopMsg {
 
 /// 客户端缓存的未消费事件上限；超出时丢弃最旧的。
 const MAX_BUFFERED_EVENTS: usize = 4096;
+
+#[derive(Debug)]
+pub struct EventLoss;
+
+impl std::fmt::Display for EventLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "buffered events were lost; reattach required")
+    }
+}
+impl std::error::Error for EventLoss {}
+
+#[derive(Default)]
+struct EventBuffer {
+    events: VecDeque<Event>,
+    lost: bool,
+}
+
+impl EventBuffer {
+    fn push(&mut self, event: Event) {
+        if self.events.len() >= MAX_BUFFERED_EVENTS {
+            self.events.pop_front();
+            self.lost = true;
+        }
+        self.events.push_back(event);
+    }
+
+    fn take(&mut self) -> std::result::Result<Option<Event>, EventLoss> {
+        if self.lost {
+            self.clear();
+            return Err(EventLoss);
+        }
+        Ok(self.events.pop_front())
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.lost = false;
+    }
+}
+
+#[cfg(test)]
+mod event_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_is_reported_before_any_remaining_event() {
+        let mut buffer = EventBuffer::default();
+        for _ in 0..=MAX_BUFFERED_EVENTS {
+            buffer.push(Event::Ended {
+                session_id: Uuid::nil(),
+            });
+        }
+        assert!(buffer.take().is_err());
+        assert!(buffer.take().unwrap().is_none());
+    }
+}
 
 struct HostKeyVerifier {
     expected: Option<String>,
@@ -467,7 +523,7 @@ impl Client {
             },
             handle,
             loop_rx,
-            event_buf: VecDeque::new(),
+            event_buf: EventBuffer::default(),
             resp_buf: VecDeque::new(),
             disconnected,
         })
@@ -523,19 +579,20 @@ impl Client {
                         }
                         self.resp_buf.push_back((rid, body));
                     }
-                    Some(LoopMsg::Event(e)) => {
-                        if self.event_buf.len() >= MAX_BUFFERED_EVENTS {
-                            self.event_buf.pop_front();
-                        }
-                        self.event_buf.push_back(e);
-                    }
+                    Some(LoopMsg::Event(e)) => self.event_buf.push(e),
                     Some(LoopMsg::Closed) | None => return None,
                 }
             }
         })
         .await;
         match result {
-            Ok(Some(response)) => Ok(response),
+            Ok(Some(response)) => {
+                // Attached 响应之前的旧订阅事件不能再夹在新快照/重放里。
+                if matches!(response, Response::Attached { .. }) {
+                    self.event_buf.clear();
+                }
+                Ok(response)
+            }
             _ => {
                 self.disconnected.store(true, Ordering::SeqCst);
                 bail!("request result unknown after timeout/disconnect; never resend automatically")
@@ -543,18 +600,18 @@ impl Client {
         }
     }
 
-    /// 异步接收服务端推送的事件。断线后返回 None（此后不再自动重试）。
-    pub async fn recv_event(&mut self) -> Option<Event> {
-        if let Some(e) = self.event_buf.pop_front() {
-            return Some(e);
+    /// 已丢事件时明确报错，调用者必须重新挂接；断线则返回 Ok(None)。
+    pub async fn recv_event(&mut self) -> std::result::Result<Option<Event>, EventLoss> {
+        if let Some(e) = self.event_buf.take()? {
+            return Ok(Some(e));
         }
         loop {
             match self.loop_rx.recv().await {
-                Some(LoopMsg::Event(e)) => return Some(e),
+                Some(LoopMsg::Event(e)) => return Ok(Some(e)),
                 Some(LoopMsg::Response { id, body }) => self.resp_buf.push_back((id, body)),
                 Some(LoopMsg::Closed) | None => {
                     self.disconnected.store(true, Ordering::SeqCst);
-                    return None;
+                    return Ok(None);
                 }
             }
         }

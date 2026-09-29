@@ -83,6 +83,21 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
     let result: Result<()> = loop {
         tokio::select! {
             ev = client.recv_event() => {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        eprintln!("\r\n[事件缓冲已溢出，按已显示偏移重新挂接]");
+                        match reattach(client, session_id, stream_id,
+                            input_buffer.acked(), displayed).await {
+                            Ok((resumed, next)) => {
+                                input_buffer.align_attach(next);
+                                if !resumed { displayed = None; pending_snapshot = None; }
+                                continue;
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    }
+                };
                 let Some(ev) = ev else {
                     eprintln!("\r\n[连接已断开，不再重发请求]");
                     break Ok(());
