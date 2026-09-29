@@ -377,9 +377,10 @@ Linux / macOS 的同样矩阵（加上 htop、less、tmux）由复核方或负�
 
 1. 使用 `tauri-plugin-autostart`（Windows 是 HKCU Run），启动参数 `--background`。设置界面加开关「登录后在后台运行接收端」，默认关（I8）。
 2. 以 `--background` 启动时不显示主窗口，只有托盘；如果 `host.json` 里 `enabled = true`，自动开始监听；然后接管 M5 里已有的 worker。
-3. 已有实例在运行时，再次启动应聚焦已有窗口（`tauri-plugin-single-instance`），不能起两个实例抢端口。
-4. macOS / Linux 同一插件可以顺带支持，但只要求 Windows 验收。
-5. 更新 README 里「不会开机自启」的描述。
+3. Windows session-worker 在创建 shell 前调用 `SetConsoleCtrlHandler(None, 0)`，清除继承的忽略 Ctrl+C 属性。
+4. 已有实例在运行时，再次启动应聚焦已有窗口（`tauri-plugin-single-instance`），不能起两个实例抢端口。
+5. macOS / Linux 同一插件可以顺带支持，但只要求 Windows 验收。
+6. 更新 README 里「不会开机自启」的描述。
 
 **验收**：打开开关 → 注销再登录 → 托盘出现，接收端在监听，另一端能连上；关闭开关后注册表项被删除。
 

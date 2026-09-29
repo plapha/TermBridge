@@ -683,6 +683,11 @@ impl SessionManager {
     }
 
     pub fn with_control_grace(grace: Duration) -> Result<Self> {
+        // 清除父进程继承的 CTRL_C 忽略属性，避免 ConPTY shell 无法中断。
+        #[cfg(windows)]
+        if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         let inner = Arc::new(Inner {
             sessions: Mutex::new(HashMap::new()),
             control_grace: grace,
@@ -1645,12 +1650,12 @@ mod tests {
         #[cfg(windows)]
         let long_running = "ping -t 127.0.0.1";
         #[cfg(not(windows))]
-        let long_running = "sleep 100";
+        let long_running = "printf 'TB_RUN_%s\n' GO; sleep 100";
         // "TTL" 只出现在 ping 的回复里，而不是命令行回显里（中英文区域设置均适用）。
         #[cfg(windows)]
         let running_marker = "TTL";
         #[cfg(not(windows))]
-        let running_marker = long_running;
+        let running_marker = "TB_RUN_GO";
         let mut offset = 0u64;
         let command = format!("{long_running}\r");
         assert!(matches!(
@@ -1662,6 +1667,7 @@ mod tests {
         let (started, seen) =
             collect_output_until(&mut subscription, running_marker, Duration::from_secs(15)).await;
         assert!(started, "long-running command did not start: {seen}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(matches!(
             mgr.input(info.id, stream, offset, b"\x03"),
