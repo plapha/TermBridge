@@ -714,9 +714,13 @@ impl SessionManager {
 
     pub fn with_control_grace(grace: Duration) -> Result<Self> {
         // 清除父进程继承的 CTRL_C 忽略属性，避免 ConPTY shell 无法中断。
+        // 尽力而为：失败只影响 Ctrl+C 继承，不应让无控制台的接收端（服务/计划任务）启动失败。
         #[cfg(windows)]
         if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
+            eprintln!(
+                "警告：无法清除继承的 Ctrl+C 忽略属性：{}",
+                std::io::Error::last_os_error()
+            );
         }
         let inner = Arc::new(Inner {
             sessions: Mutex::new(HashMap::new()),
