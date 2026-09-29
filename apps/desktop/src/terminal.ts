@@ -81,12 +81,6 @@ export class TerminalView {
       this.callbacks.onInput(bytes);
     });
     this.term.attachCustomKeyEventHandler((event) => this.handleKey(event));
-    // 非 Windows：至少拦掉会刷新/破坏页面的浏览器快捷键。
-    container.addEventListener(
-      "keydown",
-      (event) => this.blockBrowserAccelerators(event as KeyboardEvent),
-      true,
-    );
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => this.scheduleFit());
       this.resizeObserver.observe(container);
@@ -138,10 +132,18 @@ export class TerminalView {
 
   private handleKey(event: KeyboardEvent): boolean {
     if (event.type !== "keydown") return true;
-    const isMac = navigator.platform.toUpperCase().includes("MAC");
+    const platform = navigator.platform.toUpperCase();
+    const isMac = platform.includes("MAC");
+    const isWindows = platform.includes("WIN");
     const mod = isMac ? event.metaKey : event.ctrlKey;
-    if (!mod) return true;
     const key = event.key.toLowerCase();
+    // 只取消 WebView 默认动作；返回 true 保留 xterm 的正常按键解析与 onData。
+    // Windows WebView2 已在原生设置中屏蔽浏览器加速键。
+    if (!isWindows && (event.key === "F5" ||
+        (mod && ["r", "w", "p", "f", "0", "+", "-", "="].includes(key)))) {
+      event.preventDefault();
+    }
+    if (!mod) return true;
     if (key === "c") {
       // 有选区（或显式 Ctrl+Shift+C）复制且不发送 ^C；否则按普通 ^C 发送。
       if (event.shiftKey || this.term.hasSelection()) {
@@ -176,18 +178,6 @@ export class TerminalView {
       if (text) this.term.paste(text);
     } catch {
       this.callbacks.onClipboardError();
-    }
-  }
-
-  private blockBrowserAccelerators(event: KeyboardEvent): void {
-    const key = event.key.toLowerCase();
-    const mod = event.ctrlKey || event.metaKey;
-    if (
-      event.key === "F5" ||
-      (mod && ["r", "w", "p", "0", "+", "-", "="].includes(key))
-    ) {
-      event.preventDefault();
-      event.stopPropagation();
     }
   }
 
