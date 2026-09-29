@@ -640,4 +640,129 @@ mod tests {
         server.await.unwrap().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
+    #[tokio::test]
+    async fn observer_input_then_take_control_keeps_offset_usable() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("termbridge-observer-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        std::env::set_var("LOCALAPPDATA", &dir);
+        #[cfg(not(windows))]
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let secret = Uuid::new_v4().to_string();
+        let host = config::init_host(&secret).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(server::run_on_listener(host.clone(), listener, async {
+            let _ = rx.await;
+        }));
+        let fp = client::probe_host("127.0.0.1", port).await.unwrap();
+        let connect = || {
+            client::ClientConfig::new(
+                "127.0.0.1",
+                port,
+                host.username.clone(),
+                client::AuthMethod::Password {
+                    password: secret.clone(),
+                },
+                fp.clone(),
+            )
+        };
+        let mut first = client::Client::connect(connect()).await.unwrap();
+        let mut second = client::Client::connect(connect()).await.unwrap();
+        let Response::Created { session } = first
+            .request(Request::Create {
+                title: "observer".into(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("create failed")
+        };
+        let sid = session.id;
+        first
+            .request(Request::Attach {
+                session_id: sid,
+                stream_id: Uuid::new_v4(),
+                input_base: 0,
+                resume_from: None,
+            })
+            .await
+            .unwrap();
+        let observer = Uuid::new_v4();
+        assert!(matches!(
+            second
+                .request(Request::Attach {
+                    session_id: sid,
+                    stream_id: observer,
+                    input_base: 0,
+                    resume_from: None,
+                })
+                .await
+                .unwrap(),
+            Response::Attached {
+                has_control: false,
+                ..
+            }
+        ));
+        let _ = read_snapshot(&mut second, sid).await;
+        second.send_input(sid, observer, 0, b"nope").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match second.recv_event().await {
+                    Some(Event::InputRejected {
+                        session_id,
+                        stream_id,
+                        offset: 4,
+                        code,
+                        ..
+                    }) if session_id == sid
+                        && stream_id == observer
+                        && code == "not_controller" =>
+                    {
+                        break
+                    }
+                    Some(_) => {}
+                    None => panic!("observer disconnected"),
+                }
+            }
+        })
+        .await
+        .expect("observer rejection was not returned");
+        assert!(matches!(
+            second
+                .request(Request::TakeControl { session_id: sid })
+                .await
+                .unwrap(),
+            Response::Accepted
+        ));
+        #[cfg(windows)]
+        let command = b"Write-Output ('TAKE_' + 'YES')\r".as_slice();
+        #[cfg(not(windows))]
+        let command = b"printf 'TAKE_%s\n' YES\r".as_slice();
+        second.send_input(sid, observer, 4, command).await.unwrap();
+        let mut next = 4 + command.len() as u64;
+        let mut output = OutputTracker::new();
+        assert!(
+            drain_until_answering(
+                &mut second,
+                sid,
+                observer,
+                &mut output,
+                "TAKE_YES",
+                Duration::from_secs(15),
+                &mut next
+            )
+            .await,
+            "input after taking control did not execute"
+        );
+        second.disconnect().await.unwrap();
+        first.disconnect().await.unwrap();
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

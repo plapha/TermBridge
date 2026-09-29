@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use termbridge_protocol::{Event, Request, Response};
+use termbridge_protocol::{Event, Request, Response, MAX_INPUT_CHUNK};
 use uuid::Uuid;
 
 use super::expect_response;
-use crate::client::Client;
+use crate::client::{Client, InputBuffer, InputRecovery};
 
 const ESCAPE: u8 = 0x1d;
 
@@ -57,7 +57,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
 
     let mut guard = RawModeGuard::enable()?;
     let mut is_controller = has_control;
-    let mut offset = input_next;
+    let mut input_buffer = InputBuffer::new(input_next);
     let mut displayed: Option<u64> = None;
     let mut pending_snapshot: Option<u64> = None;
     let mut end_armed: Option<Instant> = None;
@@ -67,7 +67,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
         session.id, session.title
     );
     if !is_controller {
-        eprintln!("当前无控制权：输入会被接收端拒绝；按 Ctrl+] t 接管。");
+        eprintln!("当前为观察模式：按键不会发送；按 Ctrl+] t 接管。");
     }
 
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputEvent>(64);
@@ -107,9 +107,9 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                             None => {}
                             Some(current) if out_offset > current => {
                                 eprintln!("\r\n[检测到输出缺口，重新挂接]");
-                                match reattach(client, session_id, stream_id, offset, Some(current)).await {
+                                match reattach(client, session_id, stream_id, input_buffer.next(), Some(current)).await {
                                     Ok((resumed, next_input)) => {
-                                        offset = offset.max(next_input);
+                                        input_buffer.align_attach(next_input);
                                         if resumed {
                                             displayed = Some(current);
                                         } else {
@@ -130,9 +130,29 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                             }
                         }
                     }
-                    Event::InputAck { .. } => {}
-                    Event::InputRejected { session_id: sid, code, message, .. } if sid == session_id => {
-                        eprintln!("\r\n[输入被拒绝: {code} {message}]");
+                    Event::InputAck { session_id: sid, stream_id: st, offset: at }
+                        if sid == session_id && st == stream_id => input_buffer.ack(at),
+                    Event::InputRejected { session_id: sid, stream_id: st, code, offset: at, .. }
+                        if sid == session_id && st == stream_id => {
+                        match input_buffer.rejected(&code, at) {
+                            InputRecovery::Consumed => eprintln!("\r\n[观察模式，按键未发送]"),
+                            InputRecovery::Retry { offset, data, delay } => {
+                                if !delay.is_zero() { tokio::time::sleep(delay).await; }
+                                for (index, chunk) in data.chunks(MAX_INPUT_CHUNK).enumerate() {
+                                    if client.send_input(session_id, stream_id,
+                                        offset + (index * MAX_INPUT_CHUNK) as u64, chunk).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            InputRecovery::Reattach { input_base } => {
+                                eprintln!("\r\n[输入状态未知，丢弃未确认字节并重新挂接]");
+                                let (_, next) = reattach(client, session_id, stream_id,
+                                    input_base, displayed).await?;
+                                input_buffer.align_attach(next);
+                            }
+                            InputRecovery::None => {}
+                        }
                     }
                     Event::Resized { session_id: sid, rows, cols } if sid == session_id => {
                         eprintln!("\r\n[远端尺寸: {cols}x{rows}]");
@@ -156,11 +176,20 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
             }
             input = input_rx.recv() => match input {
                 Some(InputEvent::Data(bytes)) => {
-                    if client.send_input(session_id, stream_id, offset, &bytes).await.is_err() {
-                        eprintln!("\r\n[连接已断开，不再重发]");
-                        break Ok(());
+                    if !is_controller {
+                        eprintln!("\r\n[观察模式，按键未发送；Ctrl+] t 接管]");
+                        continue;
                     }
-                    offset += bytes.len() as u64;
+                    for chunk in bytes.chunks(MAX_INPUT_CHUNK) {
+                        let Some(at) = input_buffer.queue(chunk) else {
+                            eprintln!("\r\n[未确认输入缓冲已满，拒绝本地按键]\x07");
+                            break;
+                        };
+                        if client.send_input(session_id, stream_id, at, chunk).await.is_err() {
+                            eprintln!("\r\n[连接已断开，状态未知的输入不会盲目重发]");
+                            break;
+                        }
+                    }
                 }
                 Some(InputEvent::Detach) => {
                     match client.request(Request::Detach { session_id }).await {

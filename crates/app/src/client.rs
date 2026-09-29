@@ -25,6 +25,178 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// 输入确认窗口；未确认字节绝不淘汰，否则无法安全地按偏移重发。
+pub const MAX_UNACKED_INPUT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InputRecovery {
+    None,
+    Consumed,
+    Retry {
+        offset: u64,
+        data: Vec<u8>,
+        delay: Duration,
+    },
+    Reattach {
+        input_base: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct InputBuffer {
+    acked: u64,
+    next: u64,
+    unacked: VecDeque<u8>,
+    rewind_pending: Option<u64>,
+}
+
+impl InputBuffer {
+    pub fn new(base: u64) -> Self {
+        Self {
+            acked: base,
+            next: base,
+            unacked: VecDeque::new(),
+            rewind_pending: None,
+        }
+    }
+
+    pub fn acked(&self) -> u64 {
+        self.acked
+    }
+    pub fn next(&self) -> u64 {
+        self.next
+    }
+    pub fn available(&self) -> usize {
+        MAX_UNACKED_INPUT_BYTES - self.unacked.len()
+    }
+
+    /// 满时拒绝新输入，不改动任何偏移或已有未确认字节。
+    pub fn queue(&mut self, data: &[u8]) -> Option<u64> {
+        if data.is_empty()
+            || data.len() > MAX_UNACKED_INPUT_BYTES.saturating_sub(self.unacked.len())
+        {
+            return None;
+        }
+        let at = self.next;
+        self.next = self.next.checked_add(data.len() as u64)?;
+        self.unacked.extend(data);
+        Some(at)
+    }
+
+    pub fn ack(&mut self, offset: u64) {
+        let target = offset.min(self.next);
+        if target <= self.acked {
+            return;
+        }
+        let consumed = (target - self.acked) as usize;
+        self.unacked.drain(..consumed);
+        self.acked = target;
+        if self.rewind_pending.is_some_and(|at| target > at) {
+            self.rewind_pending = None;
+        }
+    }
+
+    pub fn rejected(&mut self, code: &str, offset: u64) -> InputRecovery {
+        match code {
+            "not_controller" => {
+                self.ack(offset);
+                InputRecovery::Consumed
+            }
+            "busy" | "input_gap" => {
+                if offset < self.acked || offset > self.next {
+                    // 缺失区间已无法还原：绝不能猜测其内容并盲目重发。
+                    let base = self.next;
+                    self.acked = base;
+                    self.unacked.clear();
+                    self.rewind_pending = None;
+                    return InputRecovery::Reattach { input_base: base };
+                }
+                if code == "input_gap" && self.rewind_pending.is_some_and(|at| at <= offset) {
+                    return InputRecovery::None;
+                }
+                self.rewind_pending = Some(offset);
+                InputRecovery::Retry {
+                    offset,
+                    data: self
+                        .unacked
+                        .iter()
+                        .skip((offset - self.acked) as usize)
+                        .copied()
+                        .collect(),
+                    delay: if code == "busy" {
+                        Duration::from_millis(50)
+                    } else {
+                        Duration::ZERO
+                    },
+                }
+            }
+            _ => InputRecovery::None,
+        }
+    }
+
+    pub fn align_attach(&mut self, remote_next: u64) {
+        if remote_next > self.next {
+            self.acked = remote_next;
+            self.next = remote_next;
+            self.unacked.clear();
+            self.rewind_pending = None;
+        } else {
+            self.ack(remote_next);
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn busy_rewinds_and_ack_drops_prefix() {
+        let mut b = InputBuffer::new(0);
+        assert_eq!(b.queue(b"abc"), Some(0));
+        assert_eq!(b.queue(b"def"), Some(3));
+        b.ack(3);
+        assert_eq!(
+            b.rejected("busy", 3),
+            InputRecovery::Retry {
+                offset: 3,
+                data: b"def".to_vec(),
+                delay: Duration::from_millis(50)
+            }
+        );
+        b.ack(6);
+        assert_eq!(b.acked(), 6);
+    }
+
+    #[test]
+    fn gap_deduplicates_and_unknown_range_reattaches() {
+        let mut b = InputBuffer::new(0);
+        b.queue(b"abc");
+        assert!(matches!(
+            b.rejected("input_gap", 0),
+            InputRecovery::Retry { .. }
+        ));
+        assert_eq!(b.rejected("input_gap", 0), InputRecovery::None);
+        b.ack(2);
+        assert_eq!(
+            b.rejected("input_gap", 0),
+            InputRecovery::Reattach { input_base: 3 }
+        );
+    }
+
+    #[test]
+    fn full_buffer_rejects_without_dropping_or_advancing() {
+        let mut b = InputBuffer::new(0);
+        assert_eq!(b.queue(&vec![42; MAX_UNACKED_INPUT_BYTES]), Some(0));
+        assert_eq!(b.queue(b"x"), None);
+        assert_eq!(b.next(), MAX_UNACKED_INPUT_BYTES as u64);
+        assert!(
+            matches!(b.rejected("busy", 0), InputRecovery::Retry { data, .. }
+            if data.len() == MAX_UNACKED_INPUT_BYTES)
+        );
+    }
+}
+
 /// OpenSSH 风格的 SHA256 主机指纹，例如 `SHA256:abcdef...`（base64，无 padding）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostFingerprint {

@@ -133,13 +133,18 @@ pub enum Event {
 ### 3.1 输入偏移（恰好一次）
 
 - 接收端为每个会话保存 `HashMap<stream_id, InputStream { next: u64, last_seen: Instant }>`，每会话最多 64 个，超出时淘汰最久未用的非控制者条目。
-- 收到 `Input{offset, data}`（`n = data.len()`，必须 `1 ≤ n ≤ MAX_INPUT_CHUNK`）：
-  - 不是控制者 → `InputRejected{not_controller}`；
-  - `offset + n <= next` → 整段重复，丢弃，照常回 `InputAck{next}`；
-  - `offset > next` → 有缺口，`InputRejected{input_gap}`，不写入；
-  - 否则写入 `data[(next - offset)..]`，`next = offset + n`，回 `InputAck{next}`。
-- `Attach` 时：已知这个 stream → `input_next = 已知 next`；未知 → 以客户端给的 `input_base` 建立条目，`input_next = input_base`。
-- 客户端保存 `acked` 和尚未确认的字节。重连后：丢掉偏移 `< input_next` 的部分，从 `input_next` 开始重发剩下的。
+- 收到 `Input{offset, data}`（`n = data.len()`，必须 `1 ≤ n ≤ MAX_INPUT_CHUNK` 且 `offset + n` 不溢出）：
+  1. 会话不存在、已结束或长度/偏移非法 → 拒绝；
+  2. `offset + n <= next` → 整段重复，丢弃，回 `InputAck{next}`；
+  3. `offset > next` → `InputRejected{input_gap, offset: next}`，不写入；
+  4. 不是控制者 → 消费但不写 PTY，`next = offset + n`，回 `InputRejected{not_controller, offset: next}`；被 LRU 淘汰的观察流按 `next = offset` 新建条目，再进行此判定；
+  5. 有界输入队列已满 → `InputRejected{busy, offset: next}`，`next` 不变；
+  6. 否则只写 `data[(next - offset)..]`，`next = offset + n`，回 `InputAck{next}`。
+- `Attach` 时：已知 stream → `next = max(next, input_base)` 并返回它；未知 → 以 `input_base` 建立条目。原 stream 重挂保持未确认缓冲及其原始偏移。
+- 客户端维护 `acked`、`next_offset`、连续未确认字节 `[acked, next_offset)`；每流缓冲有限（当前 256 KiB）。满时拒绝本地新输入并提示，不淘汰旧字节；已知是观察者时不发送。
+- `InputAck{offset R}` 与 `InputRejected{not_controller, offset R}` 都表示服务端消费到 R：推进 `acked` 并丢弃 R 之前的未确认字节；后者还提示观察模式，输入未写入 PTY。
+- `InputRejected{busy | input_gap, offset R}`：如果 R 在缓冲覆盖范围内，从 R 重发 `[R, next_offset)`；busy 延迟 50 ms，gap 立即，同一个 R 的在途 gap 用 `rewind_pending` 去重。其他错误不重发。
+- R 早于缓冲起点，或者无法确定字节时，丢弃无法还原的未确认部分，用**同一个** `stream_id`、`input_base = next_offset` 重新 Attach 对齐并提示用户；不能盲目补发。重连后也要按服务端 `input_next` 对齐，且只重发仍有缓冲的部分。
 - **断线期间用户新敲的键不排队**：GUI 显示「重连中」，丢弃新输入。只重发断线前已发出但未确认的字节。
 - 写入走每会话独立的**写线程**：`Input` 处理把字节放进有界队列（上限 1 MiB 待写字节）后立即回 ACK；队列满时回 `InputRejected{busy}`，`next` 不前进，客户端稍后按偏移重发。ConPTY 写阻塞只会阻塞写线程，不影响读线程（I4）。
 

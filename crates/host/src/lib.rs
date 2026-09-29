@@ -894,6 +894,7 @@ impl SessionManager {
                 last_seen: Instant::now(),
             });
             entry.last_seen = Instant::now();
+            entry.next = entry.next.max(input_base);
             entry.next
         };
 
@@ -999,18 +1000,37 @@ impl SessionManager {
                 next: next_of(&session),
             };
         }
-        let is_controller = {
-            let control = session.control.lock().unwrap();
-            control.controller == Some(stream_id) && control.attached.contains(&stream_id)
-        };
-        if !is_controller {
+        let Some(end) = offset.checked_add(n as u64) else {
             return InputOutcome::Rejected {
-                code: "not_controller",
-                message: "只有控制者可以输入".into(),
+                code: "invalid_input",
+                message: "输入偏移超出范围".into(),
                 next: next_of(&session),
             };
-        }
+        };
+        let control = session.control.lock().unwrap();
+        let is_controller =
+            control.controller == Some(stream_id) && control.attached.contains(&stream_id);
         let mut streams = session.input_streams.lock().unwrap();
+        if !streams.contains_key(&stream_id) && !is_controller {
+            // 被 LRU 淘汰的观察流从它的首个帧偏移重新建条目，不强制回到零。
+            if streams.len() >= MAX_INPUT_STREAMS {
+                let victim = streams
+                    .iter()
+                    .filter(|(id, _)| Some(**id) != control.controller)
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(id, _)| *id);
+                if let Some(victim) = victim {
+                    streams.remove(&victim);
+                }
+            }
+            streams.insert(
+                stream_id,
+                InputStream {
+                    next: offset,
+                    last_seen: Instant::now(),
+                },
+            );
+        }
         let Some(entry) = streams.get_mut(&stream_id) else {
             return InputOutcome::Rejected {
                 code: "not_controller",
@@ -1020,7 +1040,7 @@ impl SessionManager {
         };
         entry.last_seen = Instant::now();
         let next = entry.next;
-        if offset.saturating_add(n as u64) <= next {
+        if end <= next {
             return InputOutcome::Ack { next };
         }
         if offset > next {
@@ -1028,6 +1048,14 @@ impl SessionManager {
                 code: "input_gap",
                 message: format!("输入缺口：期望偏移 {next}，收到 {offset}"),
                 next,
+            };
+        }
+        if !is_controller {
+            entry.next = end;
+            return InputOutcome::Rejected {
+                code: "not_controller",
+                message: "观察模式，按键未发送".into(),
+                next: end,
             };
         }
         let skip = (next - offset) as usize;
@@ -1038,8 +1066,8 @@ impl SessionManager {
                 next,
             };
         }
-        entry.next = offset + n as u64;
-        InputOutcome::Ack { next: entry.next }
+        entry.next = end;
+        InputOutcome::Ack { next: end }
     }
 
     pub fn resize(&self, session_id: Uuid, stream_id: Uuid, rows: u16, cols: u16) -> Result<()> {
@@ -1404,6 +1432,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_consumes_offset_without_writing_then_can_take_control() {
+        let mgr = SessionManager::new().unwrap();
+        let fake = fake_session(&mgr);
+        let controller = Uuid::new_v4();
+        let observer = Uuid::new_v4();
+        mgr.attach(fake.session.id, controller, 0, None).unwrap();
+        mgr.attach(fake.session.id, observer, 0, None).unwrap();
+        assert!(matches!(
+            mgr.input(fake.session.id, observer, 0, b"hello"),
+            InputOutcome::Rejected {
+                code: "not_controller",
+                next: 5,
+                ..
+            }
+        ));
+        assert!(written_bytes(&fake).is_empty());
+        mgr.take_control(fake.session.id, observer).unwrap();
+        assert!(matches!(
+            mgr.input(fake.session.id, observer, 5, b"ok"),
+            InputOutcome::Ack { next: 7 }
+        ));
+        assert!(wait_until(Duration::from_secs(2), || written_bytes(&fake) == b"ok"));
+        assert_eq!(
+            mgr.attach(fake.session.id, observer, 3, None)
+                .unwrap()
+                .input_next,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn gap_precedes_not_controller() {
+        let mgr = SessionManager::new().unwrap();
+        let fake = fake_session(&mgr);
+        mgr.attach(fake.session.id, Uuid::new_v4(), 0, None)
+            .unwrap();
+        let observer = Uuid::new_v4();
+        mgr.attach(fake.session.id, observer, 0, None).unwrap();
+        assert!(matches!(
+            mgr.input(fake.session.id, observer, 3, b"x"),
+            InputOutcome::Rejected {
+                code: "input_gap",
+                next: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mgr.input(fake.session.id, observer, 0, b"abc"),
+            InputOutcome::Rejected {
+                code: "not_controller",
+                next: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mgr.input(fake.session.id, observer, 0, b"abc"),
+            InputOutcome::Ack { next: 3 }
+        ));
+        assert!(written_bytes(&fake).is_empty());
+    }
+
+    #[tokio::test]
     async fn input_stream_table_evicts_oldest_observer() {
         let mgr = SessionManager::new().unwrap();
         let fake = fake_session(&mgr);
@@ -1427,7 +1517,7 @@ mod tests {
                 .unwrap();
         }
         let attachment = mgr.attach(fake.session.id, controller, 7, None).unwrap();
-        assert_eq!(attachment.input_next, 0);
+        assert_eq!(attachment.input_next, 7);
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use std::sync::{Arc, atomic::Ordering};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use termbridge::client::{AuthMethod, Client, ClientConfig};
+use termbridge::client::{AuthMethod, Client, ClientConfig, InputBuffer, InputRecovery};
 use termbridge::config::{
     self, host_path, known_hosts_path, profiles_path, read_json, save_json, HostConfig, Profile,
     Profiles,
@@ -653,7 +653,7 @@ fn spawn_pump(
                     None => break,
                 },
                 ev = client.recv_event() => match ev {
-                    Some(e) => forward_event(&emit_tx, &session, &e).await,
+                    Some(e) => forward_event(&emit_tx, &session, &mut client, &e).await,
                     None => {
                         session.set_meta(|m| {
                             m.online = false;
@@ -674,6 +674,7 @@ fn spawn_pump(
 async fn forward_event(
     tx: &tokio::sync::mpsc::Sender<FrontEvent>,
     session: &Arc<Session>,
+    client: &mut Client,
     event: &Event,
 ) {
     let front = match event {
@@ -706,15 +707,40 @@ async fn forward_event(
         }),
         Event::InputAck { stream_id, offset, .. } => {
             if *stream_id == session.stream_id {
-                session.ack_input(*offset);
+                session.input_buffer.lock().unwrap().ack(*offset);
             }
             return;
         }
-        Event::InputRejected { session_id, code, message, .. } => {
+        Event::InputRejected { session_id, stream_id, offset, code, message } => {
+            if *stream_id != session.stream_id { return; }
+            let recovery = session.input_buffer.lock().unwrap().rejected(code, *offset);
+            match recovery {
+                InputRecovery::Retry { offset, data, delay } => {
+                    let _gate = session.input_gate.lock().await;
+                    if !delay.is_zero() { tokio::time::sleep(delay).await; }
+                    for (index, chunk) in data.chunks(MAX_INPUT_CHUNK).enumerate() {
+                        if session.input_sender.send_input(*session_id, *stream_id,
+                            offset + (index * MAX_INPUT_CHUNK) as u64, chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                InputRecovery::Reattach { input_base } => {
+                    // 缺失字节不再存在，保持同一流并显式让服务端对齐，不能猜测后重发。
+                    let result = client.request(Request::Attach {
+                        session_id: *session_id, stream_id: *stream_id,
+                        input_base, resume_from: None,
+                    }).await;
+                    if let Ok(Response::Attached { input_next, .. }) = result {
+                        session.input_buffer.lock().unwrap().align_attach(input_next);
+                    }
+                }
+                InputRecovery::Consumed | InputRecovery::None => {}
+            }
             FrontEvent::InputRejected(InputRejectedEv {
                 session_id: session_id.to_string(),
-                code: code.clone(),
-                message: message.clone(),
+                code: code.clone(), message: message.clone(),
             })
         }
         Event::Resized { session_id, rows, cols } => FrontEvent::Resized(ResizedEv {
@@ -869,11 +895,9 @@ pub async fn create_session(
         meta: std::sync::Mutex::new(meta),
         tx,
         stream_id: Uuid::new_v4(),
-        input_offset: std::sync::Mutex::new(0),
-        input_acked: std::sync::Mutex::new(0),
+        input_buffer: std::sync::Mutex::new(InputBuffer::new(0)),
         input_sender: client.input_sender(),
         input_gate: tokio::sync::Mutex::new(()),
-        input_unacked: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pump(client, app.clone(), session.clone(), session_uuid, rx);
     {
@@ -939,11 +963,9 @@ pub async fn connect_existing_session(
         meta: std::sync::Mutex::new(meta),
         tx,
         stream_id,
-        input_offset: std::sync::Mutex::new(0),
-        input_acked: std::sync::Mutex::new(0),
+        input_buffer: std::sync::Mutex::new(InputBuffer::new(0)),
         input_sender: client.input_sender(),
         input_gate: tokio::sync::Mutex::new(()),
-        input_unacked: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pump(client, app.clone(), session.clone(), sid, rx);
     let state: tauri::State<AppState> = app.state();
@@ -963,7 +985,7 @@ pub async fn attach_session(
     let state: tauri::State<AppState> = app.state();
     let session = find_session(&state, &session_id)?;
     let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
-    let input_base = *session.input_acked.lock().unwrap();
+    let input_base = session.input_buffer.lock().unwrap().acked();
     let resp = pump_request(
         &session,
         Request::Attach {
@@ -986,10 +1008,7 @@ pub async fn attach_session(
                 m.is_controller = has_control;
                 m.online = true;
             });
-            let mut offset = session.input_offset.lock().unwrap();
-            if input_next > *offset {
-                *offset = input_next;
-            }
+            session.input_buffer.lock().unwrap().align_attach(input_next);
             let info = to_front_info(&remote, &session.info());
             Ok(serde_json::json!({ "session": info, "resumed": resumed, "input_next": input_next }))
         }
@@ -1057,15 +1076,14 @@ pub async fn send_input(
     };
     // 串行化并发输入：偏移分配与帧发送必须同序。
     let _gate = session.input_gate.lock().await;
+    if data.len() > session.input_buffer.lock().unwrap().available() {
+        return Err(ipc("未确认输入缓冲已满，拒绝本地新输入"));
+    }
     for chunk in data.chunks(MAX_INPUT_CHUNK) {
-        let offset = session.next_input_offset(chunk.len());
-        session
-            .input_sender
-            .send_input(sid, session.stream_id, offset, chunk)
-            .await
-            .map_err(ipc)?;
-        // 记录未确认输入，供重连按偏移重发（M4）。
-        session.record_input(offset, chunk);
+        let offset = session.input_buffer.lock().unwrap().queue(chunk)
+            .ok_or_else(|| ipc("未确认输入缓冲已满，拒绝本地新输入"))?;
+        session.input_sender.send_input(sid, session.stream_id, offset, chunk)
+            .await.map_err(ipc)?;
     }
     Ok(())
 }
