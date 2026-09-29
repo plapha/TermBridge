@@ -6,19 +6,27 @@
 - 接收端自带 SSH 服务（基于 [russh](https://github.com/Eugeny/russh)），不需要系统里的 OpenSSH，也不依赖 RustDesk 之类的软件。
 - 支持 Windows、Linux、macOS。桌面版是一个 Tauri 图形界面，里面带着同版本的 `termbridge` 命令行工具。没有桌面环境的服务器可以只装命令行工具。
 
-> 当前版本 0.1.1，开发阶段。已经验证了什么、还没验证什么，见文末[现状](#现状)。
+> 当前版本 0.2.0，开发阶段。已经验证了什么、还没验证什么，见文末[现状](#现状)。
 
 ## 它适合做什么，不适合做什么
 
-适合在远端机器上开几个 shell，跑命令、看输出、中途断开、换一台设备接着看，比如跑构建、跑长任务、查日志。
+适合在远端机器上开几个 shell，跑命令、看输出、中途断开、换一台设备接着看，比如跑构建、跑长任务、查日志，或者在远端跑 Claude Code、Codex 这类交互程序。
 
-不适合交互式全屏程序。输入是**整行提交**的：在输入框里写好一行，点「发送」（命令行模式下按 Enter）才会送到远端。按键不会实时转发，所以 vim、top、less 这类程序用不了。这样设计是为了避免误触和重复执行（见[安全设计](#安全设计)）。
+从 0.2.0 起，终端是**原生交互**的：每个按键（Ctrl+C、Esc、方向键、Tab 等）都实时送到远端，vim、htop、less 这类全屏程序也能用。0.1.x 的「整行提交」模式已经取消。
 
 它也不是通用 SSH 客户端或服务端：不能用 TermBridge 连普通的 sshd，也不能用 `ssh` 命令连 TermBridge 的接收端。
 
 ## 下载安装
 
-从 [Releases](https://github.com/plapha/TermBridge/releases) 下载：Windows 用 `.exe` 安装包，Debian/Ubuntu 用 `.deb`，macOS 用 `.dmg`（仅 Apple Silicon）。目前只提供 x86_64 的 Windows 和 Linux 版本。
+从 [Releases](https://github.com/plapha/TermBridge/releases) 下载，都是 64 位：
+
+| 平台 | 文件 |
+|---|---|
+| Windows 10/11 x64 | `TermBridge_<版本>_x64-setup.exe` 安装程序 |
+| Debian / Ubuntu x86_64 | `TermBridge_<版本>_amd64.deb` |
+| macOS（Apple Silicon 和 Intel 通用） | `TermBridge_<版本>_universal.dmg` |
+
+0.2 的协议和 0.1.x 不兼容，连接的两端都要升级到 0.2。
 
 安装包没有代码签名：
 
@@ -65,7 +73,7 @@ termbridge host run                             # 在前台运行；按 Ctrl+C �
 
 ### 2. 在 B 上连接 A
 
-**GUI**：新建连接，填写地址、端口、用户名和认证方式。第一次连接会显示 A 的主机指纹，请和 A 上 `host status` 显示的指纹核对，一致再确认。之后可以新建会话、打开标签页，在输入框里写命令并点「发送」。
+**GUI**：新建连接，填写地址、端口、用户名和认证方式。第一次连接会显示 A 的主机指纹，请和 A 上 `host status` 显示的指纹核对，一致再确认。之后可以新建会话、打开标签页，直接在终端里打字。
 
 **命令行**：
 
@@ -81,19 +89,20 @@ termbridge session attach -p a-box --session-id <UUID>   # 不写 --session-id �
 
 第一次连接时，命令行会显示指纹，输入 `yes` 才会记住它。
 
-进入 `session attach` 之后，每输入一行按 Enter 发送。下面几条是内置命令：
+`session attach` 会把本地终端切到 raw 模式，按键原样送到远端；退出时（包括出错）恢复终端设置。它需要在真实终端里运行，不支持管道输入。先按 **Ctrl+]** 再按一个键执行本地命令：
 
-| 输入 | 作用 |
+| 按键 | 作用 |
 |---|---|
-| `:take` | 接管控制权 |
-| `:detach` | 断开当前客户端，远端终端继续运行 |
-| `:end` | 结束远端终端 |
+| Ctrl+] 然后 d | 断开当前客户端，远端终端继续运行 |
+| Ctrl+] 然后 t | 接管控制权 |
+| Ctrl+] 然后 e | 结束远端终端（3 秒内再按一次确认） |
+| Ctrl+] 然后 Ctrl+] | 发送一个 Ctrl+] 字符 |
 
 没有人控制的会话，可以直接用 `termbridge session end -p a-box --session-id <UUID>` 结束。如果其他客户端正在控制这个会话，需要加 `--take-control`。
 
 ## 会话的生命周期
 
-- **断开不影响终端**：客户端断开、退出或网络中断时，远端终端照常运行。重新连接后，会先收到一份当前画面，再接着收新的输出。
+- **断开不影响终端**：客户端断开、退出或网络中断时，远端终端照常运行。重新连接后，会先收到一份当前画面，再接着收新的输出。目前断线后不会自动重连，需要手动重新附着（自动重连在开发计划里）。
 - **终端自己退出时会被清理**：在终端里执行 `exit`，或者程序正常结束，会话会马上从列表里移除，占用的终端资源和滚动历史也会释放。已连接的客户端会收到「会话结束」的通知。
 - **接收端停止时，所有会话一起结束**：包括按 Ctrl+C、在 GUI 里「停止接收」、从托盘退出。在 Windows 上，终端里启动的子进程会通过 Job Object 一起被结束；即使接收进程意外退出也是如此。Linux 和 macOS 上目前只会结束 shell 本身，shell 在后台启动的进程可能会留下来。
 - **会话只保存在内存里**：接收端或机器重启后，原来的会话都没有了，也不会自动重建。用旧的 UUID 重新接入会直接报错。
@@ -102,8 +111,8 @@ termbridge session attach -p a-box --session-id <UUID>   # 不写 --session-id �
 
 - **认证**：推荐使用现有的 SSH 公钥。也可以用 TermBridge 专用密码，接收端只保存它的 Argon2 哈希。TermBridge 不读取、也不校验系统账户的登录密码。同一个 IP 连续失败 5 次后，10 分钟内会被拒绝连接。
 - **主机指纹锁定**：第一次连接时由你手动确认指纹，之后指纹一变就拒绝连接，不会自动信任新指纹。这里的主机密钥是 TermBridge 自己的，和系统 OpenSSH 的主机密钥不是同一个。
-- **不会重复执行**：每次发送都带一个唯一 ID，接收端会拒绝重复的 ID。如果一次发送的结果不确定（超时或断线），客户端会报错，**不会自动重发**。
-- **输入需要明确提交**：GUI 的终端画面是只读的，键盘输入不会直接进入远端，只有点「发送」才会提交一行。首版不允许发送换行和控制字符。
+- **按键不重复、不乱序**：输入按字节偏移编号，接收端确认后才从客户端缓冲里删除；重复的字节会被丢弃，缺口会让客户端从确认点重发。状态无法确定时（例如断线），客户端会丢弃未确认的按键并提示，**不会盲目重发**。
+- **只有控制者能输入**：观察者的按键不会写进终端，客户端会提示先「接管」。
 - **本地保存的内容**：密码和 GUI 记住的指纹优先存进系统凭据库（Windows 凭据管理器、macOS 钥匙串、Linux Secret Service）。凭据库不可用时，指纹会存到权限受限的 `known_hosts.json`，而密码会在每次连接时询问。私钥只从原来的位置读取，不会被复制；私钥的口令不会保存。日志里不会记录密码，也不会记录终端的原始输出。
 
 配置目录：Windows 是 `%LOCALAPPDATA%\TermBridge\`，Linux 和 macOS 是 `$XDG_CONFIG_HOME/termbridge/`（默认 `~/.config/termbridge/`）。其中 `host.json` 和 `host_key` 属于接收端，`profiles.json` 属于连接端。
@@ -155,17 +164,19 @@ npm ci
 npm run build:windows             # 或 build:linux（deb）、build:macos（dmg）
 ```
 
-打包脚本会先用 `scripts/prepare_sidecar.py` 为当前平台编译命令行工具，放进 Tauri 的 sidecar 目录，然后打包。安装包输出在 `apps/desktop/src-tauri/target/release/bundle/`。`.github/workflows/build.yml` 会在三个平台上测试并打包。
+macOS 打的是 Intel + Apple Silicon 通用包，需要先 `rustup target add aarch64-apple-darwin x86_64-apple-darwin`。
 
-发布新版本：先把 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json` 和 `apps/desktop/src-tauri/Cargo.toml` 里的版本号改成一致，然后推送同名标签（例如 `v0.1.2`）。三个平台都构建成功后，CI 会自动创建 Release 并上传安装包；标签和版本号不一致时不会发布。
+打包脚本会先用 `scripts/prepare_sidecar.py` 为当前平台编译命令行工具，放进 Tauri 的 sidecar 目录，然后打包。安装包输出在 `apps/desktop/src-tauri/target/release/bundle/`（macOS 在 `target/universal-apple-darwin/release/bundle/`）。`.github/workflows/build.yml` 会在三个平台上测试并打包。
+
+发布新版本：先把 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json` 和 `apps/desktop/src-tauri/Cargo.toml` 里的版本号改成一致，然后推送同名标签（例如 `v0.2.1`）。三个平台都构建成功后，CI 会自动创建 Release 并上传安装包；标签和版本号不一致时不会发布。
 
 ## 代码结构
 
 ```
-crates/protocol   连接端与接收端之间的消息格式（每行一个 JSON，通过 SSH subsystem termbridge-v1 传输）
-crates/host       终端进程（portable-pty）、会话表、画面快照（vt100）、控制权、防重复发送
+crates/protocol   连接端与接收端之间的消息格式（每行一个 JSON，通过 SSH subsystem termbridge-v2 传输）
+crates/host       终端进程（portable-pty）、会话表、输出环与重放、画面快照（vt100）、控制权、输入偏移
 crates/app        SSH 接收端和连接端、配置与认证、termbridge 命令行工具
-apps/desktop      Tauri 2 图形界面（TypeScript + xterm.js 只读显示）
+apps/desktop      Tauri 2 图形界面（TypeScript + xterm.js 交互终端）
 scripts           打包辅助脚本
 ```
 
@@ -173,16 +184,15 @@ scripts           打包辅助脚本
 
 已验证：
 
-- 在 Windows 本机上跑通了从接收端到连接端的完整流程：连接、发送、断开、重新接入、恢复画面，以及结束会话、终端退出后自动清理、拒绝同一连接上的第二个通道。
-- GitHub Actions 在 Windows、Linux、macOS 上都能编译通过，单元测试也都通过。
+- 自动化测试（GitHub Actions 在 Windows、Linux、macOS 上都通过）：本机两端互连的原始按键收发、断开后续传、观察者接管、刷屏时按键不卡死、Ctrl+C 中断、命令行 raw 模式附着等。
 
 还没有验证：
 
+- 0.2 的 GUI 和命令行交互还没有在真实桌面上人工验收（PowerShell、Claude Code、Codex、vim、中文输入法、剪贴板、快捷键等）。
 - Linux 和 macOS 之间的实机互连。
 - Windows 用户注销后，终端是否真的会被结束。
-- GUI 的人工操作流程，包括首次确认指纹、托盘、GUI 和命令行交替操作同一个会话。
 
-已知限制：不支持全屏交互程序；客户端还不能发送 Ctrl+C（协议里有中断请求，但 GUI 和命令行都没有提供这个入口），卡住的命令只能结束整个会话；没有中继和 NAT 穿透；会话在重启后不保留；Linux 和 macOS 上结束会话时不会结束后台子进程。
+已知限制：断线后不会自动重连；重新附着时滚动历史只按纯文本恢复（没有颜色）；没有中继和 NAT 穿透；会话在接收端重启后不保留；Linux 和 macOS 上结束会话时不会结束后台子进程；Windows 命令行退出 attach 后，可能会多吞掉一个按键。
 
 ## 许可证
 

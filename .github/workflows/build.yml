@@ -22,11 +22,15 @@ jobs:
           - os: macos-latest
             script: build:macos
             artifact: macos-dmg
-            files: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            files: apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            # Intel + Apple Silicon 通用包
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

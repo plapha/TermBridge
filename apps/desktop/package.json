@@ -1,7 +1,7 @@
 {
   "name": "termbridge-desktop",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,7 @@
     "build:desktop": "python ../../scripts/prepare_sidecar.py --release && tauri build",
     "build:windows": "python ../../scripts/prepare_sidecar.py --release && tauri build --bundles nsis",
     "build:linux": "python ../../scripts/prepare_sidecar.py --release && tauri build --bundles deb",
-    "build:macos": "python ../../scripts/prepare_sidecar.py --release && tauri build --bundles dmg"
+    "build:macos": "python ../../scripts/prepare_sidecar.py --release --target universal-apple-darwin && tauri build --target universal-apple-darwin --bundles dmg"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
