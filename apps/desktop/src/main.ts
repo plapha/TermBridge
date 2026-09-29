@@ -28,6 +28,52 @@ const terminals = new Map<string, TerminalView>();
 const snapshotPending = new Set<string>();
 const pendingOutputs = new Map<string, SessionOutputEvent[]>();
 const reattaching = new Set<string>();
+const MAX_INPUT_INVOKE = 16 * 1024;
+const MAX_PENDING_INPUT = 256 * 1024;
+interface InputQueue { pending: number[]; sending: boolean; closed: boolean }
+const inputQueues = new Map<string, InputQueue>();
+
+/** JS 单线程按 onData/onBinary 到达顺序入队；只有一个循环可调用异步 invoke。 */
+function enqueueInput(sessionId: string, bytes: Uint8Array): void {
+  let queue = inputQueues.get(sessionId);
+  if (!queue) {
+    queue = { pending: [], sending: false, closed: false };
+    inputQueues.set(sessionId, queue);
+  }
+  if (queue.pending.length + bytes.length > MAX_PENDING_INPUT) {
+    showHint("本地输入队列已满，当前按键未发送。\x07");
+    return;
+  }
+  for (const byte of bytes) queue.pending.push(byte);
+  if (queue.sending) return;
+  queue.sending = true;
+  void drainInput(sessionId, queue);
+}
+
+async function drainInput(sessionId: string, queue: InputQueue): Promise<void> {
+  try {
+    while (!queue.closed && queue.pending.length) {
+      const batch = queue.pending.splice(0, MAX_INPUT_INVOKE);
+      // 一个 invoke 完成之后才发送下一个；失败时不猜测状态也不自动重发。
+      await commands.sendInput(sessionId, batch);
+    }
+  } catch (err) {
+    queue.pending.length = 0;
+    handleError(err, "输入发送失败（状态未知，不自动重发）");
+  } finally {
+    queue.sending = false;
+    if (!queue.closed && queue.pending.length) {
+      queue.sending = true;
+      void drainInput(sessionId, queue);
+    }
+  }
+}
+
+function closeInputQueue(sessionId: string): void {
+  const queue = inputQueues.get(sessionId);
+  if (queue) { queue.closed = true; queue.pending.length = 0; }
+  inputQueues.delete(sessionId);
+}
 const unlisteners: Array<() => void> = [];
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
@@ -190,11 +236,7 @@ function ensureTerminal(sessionId: string): TerminalView {
     container.className = "terminal-instance";
     $("terminal-stack").appendChild(container);
     view = new TerminalView(sessionId, container, {
-      onInput: (bytes) => {
-        void commands
-          .sendInput(sessionId, Array.from(bytes))
-          .catch((err) => handleError(err, "输入发送失败"));
-      },
+      onInput: (bytes) => enqueueInput(sessionId, bytes),
       onBlockedInput: () => showHint("观察模式：点「接管输入」后可输入。"),
       onResize: () => void syncResize(sessionId),
       onClipboardError: () => showHint("无法访问系统剪贴板。"),
@@ -695,6 +737,7 @@ async function endSession(sessionId: string): Promise<void> {
   try {
     const s = await commands.endSession(sessionId);
     state.sessions = state.sessions.map((x) => (x.session_id === s.session_id ? s : x));
+    closeInputQueue(sessionId);
     terminals.get(sessionId)?.dispose();
     terminals.delete(sessionId);
     if (state.activeSessionId === sessionId) {
