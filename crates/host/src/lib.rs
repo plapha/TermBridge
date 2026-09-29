@@ -259,7 +259,12 @@ impl StreamTracker {
                     }
                 }
             }
-            b'q' => {
+            b'q' if self.params.last() == Some(&b' ')
+                && self.params[..self.params.len() - 1]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || *b == b';') =>
+            {
+                // DECSCUSR 是 CSI Ps SP q；CSI > q 是 XTVERSION 查询，不能重放为光标样式。
                 let mut seq = Vec::with_capacity(self.params.len() + 3);
                 seq.extend_from_slice(b"\x1b[");
                 seq.extend_from_slice(&self.params);
@@ -1773,6 +1778,20 @@ mod tests {
         .await
         .expect("resumed subscriber did not replay the suffix");
         assert_eq!(replayed, suffix);
+    }
+
+    #[test]
+    fn xtversion_query_is_not_recorded_as_cursor_style() {
+        let mut tracker = StreamTracker::default();
+        tracker.scan(b"\x1b[>q");
+        assert!(tracker.cursor_style.is_none());
+        tracker.scan(b"\x1b[2! q");
+        assert!(tracker.cursor_style.is_none());
+        tracker.scan(b"\x1b[2 q");
+        assert_eq!(
+            tracker.cursor_style.as_deref(),
+            Some(b"\x1b[2 q".as_slice())
+        );
     }
 
     #[tokio::test]
