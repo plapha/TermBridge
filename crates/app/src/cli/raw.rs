@@ -106,11 +106,11 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                     Event::SnapshotBegin { session_id: sid, offset: snap_offset, .. } if sid == session_id => {
                         pending_snapshot = Some(snap_offset);
                         displayed = None;
-                        let _ = write_stdout(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+                        write_stdout(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H").context("终端输出失败")?;
                     }
                     Event::SnapshotChunk { session_id: sid, data_b64 } if sid == session_id => {
                         if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
-                            let _ = write_stdout(&data);
+                            write_stdout(&data).context("终端输出失败")?;
                         }
                     }
                     Event::SnapshotEnd { session_id: sid } if sid == session_id => {
@@ -141,7 +141,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                                 let end = out_offset + data.len() as u64;
                                 if end > current {
                                     let skip = (current - out_offset) as usize;
-                                    let _ = write_stdout(&data[skip..]);
+                                    write_stdout(&data[skip..]).context("终端输出失败")?;
                                     displayed = Some(end);
                                 }
                             }
@@ -330,8 +330,64 @@ async fn send_local_size(client: &mut Client, session_id: Uuid) {
     }
 }
 
+#[cfg(windows)]
+#[derive(Default)]
+struct Utf8OutputDecoder {
+    pending: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl Utf8OutputDecoder {
+    fn decode(&mut self, data: &[u8]) -> String {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(data);
+        let mut result = String::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            match std::str::from_utf8(&bytes[at..]) {
+                Ok(valid) => {
+                    result.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    result.push_str(std::str::from_utf8(&bytes[at..at + valid]).unwrap());
+                    at += valid;
+                    match error.error_len() {
+                        Some(len) => {
+                            result.push(char::REPLACEMENT_CHARACTER);
+                            at += len;
+                        }
+                        None => {
+                            self.pending.extend_from_slice(&bytes[at..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+static OUTPUT_DECODER: std::sync::OnceLock<Mutex<Utf8OutputDecoder>> = std::sync::OnceLock::new();
+
 fn write_stdout(data: &[u8]) -> std::io::Result<()> {
-    let mut out = std::io::stdout().lock();
+    let stdout = std::io::stdout();
+    #[cfg(windows)]
+    if stdout.is_terminal() {
+        // WriteConsoleW 拒绝非法 UTF-8：跨事件保留不完整尾部，非法字节替换。
+        let text = OUTPUT_DECODER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .decode(data);
+        let mut out = stdout.lock();
+        out.write_all(text.as_bytes())?;
+        return out.flush();
+    }
+    let mut out = stdout.lock();
     out.write_all(data)?;
     out.flush()
 }
@@ -558,6 +614,26 @@ fn restore_terminal(state: RestoreState) {
     }
 }
 
+#[cfg(windows)]
+fn is_terminal_exit_event(kind: u32) -> bool {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT};
+    kind == CTRL_BREAK_EVENT || kind == CTRL_CLOSE_EVENT
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn restore_on_console_exit(kind: u32) -> i32 {
+    if !is_terminal_exit_event(kind) {
+        return 0;
+    }
+    if let Ok(mut state) = RESTORE_STATE.lock() {
+        if let Some(state) = state.take() {
+            restore_terminal(state);
+        }
+    }
+    // 不吞掉 Ctrl+Break / 关窗；让系统默认处理器继续完成退出。
+    0
+}
+
 fn install_panic_hook() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
@@ -589,6 +665,18 @@ impl RawModeGuard {
         {
             let (input, output) = enable_windows_raw()?;
             *RESTORE_STATE.lock().unwrap() = Some(RestoreState::Windows { input, output });
+            if unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(restore_on_console_exit),
+                    1,
+                )
+            } == 0
+            {
+                if let Some(state) = RESTORE_STATE.lock().unwrap().take() {
+                    restore_terminal(state);
+                }
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         Ok(Self { active: true })
     }
@@ -600,6 +688,13 @@ impl RawModeGuard {
         self.active = false;
         if let Some(state) = RESTORE_STATE.lock().unwrap().take() {
             restore_terminal(state);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(restore_on_console_exit),
+                0,
+            );
         }
     }
 }
@@ -646,6 +741,26 @@ fn enable_windows_raw() -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn console_exit_handler_only_targets_break_and_close() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+        };
+        assert!(is_terminal_exit_event(CTRL_BREAK_EVENT));
+        assert!(is_terminal_exit_event(CTRL_CLOSE_EVENT));
+        assert!(!is_terminal_exit_event(CTRL_C_EVENT));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf8_stdout_decoder_preserves_split_tail_and_replaces_invalid() {
+        let mut decoder = Utf8OutputDecoder::default();
+        assert_eq!(decoder.decode(&[0xe4, 0xb8]), "");
+        assert_eq!(decoder.decode(&[0xad, 0xff, b'!']), "中�!");
+        assert_eq!(decoder.decode(b"\x1b[2J"), "\x1b[2J");
+    }
 
     #[cfg(windows)]
     #[test]

@@ -153,7 +153,8 @@ export class TerminalView {
       }
       return true;
     }
-    if (key === "v") {
+    // Linux 的 Ctrl+V 是 vim 列选择；只有 Ctrl+Shift+V 是粘贴。
+    if (key === "v" && (isMac || isWindows || event.shiftKey)) {
       event.preventDefault();
       void this.pasteFromClipboard();
       return false;

@@ -107,7 +107,7 @@ impl OutputLog {
         debug_assert!(from >= self.start && from <= self.end);
         let skip = (from - self.start) as usize;
         let take = ((self.end - from) as usize).min(max);
-        self.buf.iter().skip(skip).take(take).copied().collect()
+        self.buf.range(skip..skip + take).copied().collect()
     }
 }
 
@@ -200,9 +200,9 @@ enum Query {
 }
 
 impl StreamTracker {
-    fn scan(&mut self, data: &[u8]) -> Vec<Query> {
+    fn scan(&mut self, data: &[u8]) -> Vec<(usize, Query)> {
         let mut queries = Vec::new();
-        for &b in data {
+        for (index, &b) in data.iter().enumerate() {
             match self.scan {
                 ScanState::Ground => {
                     if b == 0x1b {
@@ -224,7 +224,7 @@ impl StreamTracker {
                         self.params.clear();
                     }
                     0x40..=0x7e => {
-                        self.finish_csi(b, &mut queries);
+                        self.finish_csi(b, index + 1, &mut queries);
                         self.scan = ScanState::Ground;
                         self.params.clear();
                     }
@@ -248,7 +248,7 @@ impl StreamTracker {
         queries
     }
 
-    fn finish_csi(&mut self, final_byte: u8, queries: &mut Vec<Query>) {
+    fn finish_csi(&mut self, final_byte: u8, end: usize, queries: &mut Vec<(usize, Query)>) {
         match final_byte {
             b'h' | b'l' => {
                 if self.params.first() == Some(&b'?') {
@@ -273,12 +273,12 @@ impl StreamTracker {
             }
             b'n' => {
                 if self.params == b"6" {
-                    queries.push(Query::CursorPosition);
+                    queries.push((end, Query::CursorPosition));
                 }
             }
             b'c' => {
                 if self.params.is_empty() || self.params == b"0" {
-                    queries.push(Query::DeviceAttributes);
+                    queries.push((end, Query::DeviceAttributes));
                 }
             }
             _ => {}
@@ -1235,12 +1235,13 @@ fn reader_loop(session: &Session, reader: &mut dyn Read) {
             Ok(n) => {
                 let (end, replies) = {
                     let mut state = session.state.lock().unwrap();
-                    state.parser.process(&buf[..n]);
-                    state.output.append(&buf[..n]);
-                    state.scrollback.push_bytes(&buf[..n]);
                     let queries = state.tracker.scan(&buf[..n]);
                     let mut replies = Vec::new();
-                    for query in queries {
+                    let mut parsed = 0;
+                    for (end, query) in queries {
+                        // 在查询结束处读取光标，而不是整块输入解析完后的最终位置。
+                        state.parser.process(&buf[parsed..end]);
+                        parsed = end;
                         match query {
                             Query::CursorPosition => {
                                 let (row, col) = state.parser.screen().cursor_position();
@@ -1251,6 +1252,9 @@ fn reader_loop(session: &Session, reader: &mut dyn Read) {
                             }
                         }
                     }
+                    state.parser.process(&buf[parsed..n]);
+                    state.output.append(&buf[..n]);
+                    state.scrollback.push_bytes(&buf[..n]);
                     (state.output.end, replies)
                 };
                 let _ = session
@@ -1420,7 +1424,7 @@ mod tests {
             Ok(Box::new(std::io::sink()))
         }
         #[cfg(unix)]
-        fn process_group_leader(&self) -> Option<libc::pid_t> {
+        fn process_group_leader(&self) -> Option<i32> {
             None
         }
         #[cfg(unix)]
@@ -1778,6 +1782,28 @@ mod tests {
         .await
         .expect("resumed subscriber did not replay the suffix");
         assert_eq!(replayed, suffix);
+    }
+
+    #[test]
+    fn output_log_range_reads_wrapped_window() {
+        let mut log = OutputLog::default();
+        log.buf = (0u8..8).collect();
+        log.buf.drain(..3);
+        log.buf.extend(8u8..11);
+        log.start = 3;
+        log.end = 11;
+        assert_eq!(log.read(5, 4), vec![5, 6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn cursor_query_replies_at_query_position_within_chunk() {
+        let mgr = SessionManager::new().unwrap();
+        let fake = fake_session(&mgr);
+        fake.feed
+            .send(b"abc\x1b[6n\x1b[2;4H\x1b[6n".to_vec())
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(2), || written_bytes(&fake)
+            == b"\x1b[1;4R\x1b[2;4R"));
     }
 
     #[test]
