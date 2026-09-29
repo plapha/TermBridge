@@ -534,10 +534,17 @@ enum FrontEvent {
     Closed(ClosedEv),
 }
 
-/// 输出合并：连续偏移累计到 16ms 空闲或 256 KiB 再 emit，避免事件洪泛。
+const MAX_COALESCE: usize = 256 * 1024;
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
+
+fn should_flush_output(first: std::time::Instant, now: std::time::Instant, len: usize) -> bool {
+    now.duration_since(first) >= COALESCE_WINDOW || len >= MAX_COALESCE
+}
+
+/// 输出合并：从第一字节起最多等待 16ms，或达到 256 KiB 就 emit。
 async fn output_emitter(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Receiver<FrontEvent>) {
-    const MAX_COALESCE: usize = 256 * 1024;
     let mut pending: Option<(String, u64, Vec<u8>)> = None;
+    let mut first_at: Option<std::time::Instant> = None;
     fn flush(app: &tauri::AppHandle, pending: &mut Option<(String, u64, Vec<u8>)>) {
         if let Some((session_id, offset, data)) = pending.take() {
             let _ = app.emit(
@@ -551,17 +558,17 @@ async fn output_emitter(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Receiv
         }
     }
     loop {
-        let event = if pending.is_some() {
-            match tokio::time::timeout(std::time::Duration::from_millis(16), rx.recv()).await {
+        let event = if let Some(first) = first_at {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(first + COALESCE_WINDOW), rx.recv()).await {
                 Ok(event) => event,
                 Err(_) => {
                     flush(&app, &mut pending);
+                    first_at = None;
                     continue;
                 }
             }
-        } else {
-            rx.recv().await
-        };
+        } else { rx.recv().await };
         let Some(event) = event else {
             break;
         };
@@ -580,11 +587,13 @@ async fn output_emitter(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Receiv
                 }
                 _ => {
                     flush(&app, &mut pending);
+                    first_at = Some(std::time::Instant::now());
                     pending = Some((session_id, offset, data));
                 }
             },
             other => {
                 flush(&app, &mut pending);
+                first_at = None;
                 match other {
                     FrontEvent::SnapshotBegin(ev) => {
                         let _ = app.emit("session_snapshot_begin", ev);
@@ -622,8 +631,30 @@ async fn output_emitter(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Receiv
                 }
             }
         }
+        if let Some(first) = first_at {
+            if pending.as_ref().is_some_and(|(_, _, data)|
+                should_flush_output(first, std::time::Instant::now(), data.len())) {
+                flush(&app, &mut pending);
+                first_at = None;
+            }
+        }
     }
     flush(&app, &mut pending);
+}
+
+#[cfg(test)]
+mod output_flush_tests {
+    use super::*;
+
+    #[test]
+    fn continuous_small_chunks_flush_from_first_byte_deadline() {
+        let first = std::time::Instant::now();
+        for ms in [5, 10, 15] {
+            assert!(!should_flush_output(first, first + std::time::Duration::from_millis(ms), 1024));
+        }
+        assert!(should_flush_output(first, first + COALESCE_WINDOW, 1024));
+        assert!(should_flush_output(first, first, MAX_COALESCE));
+    }
 }
 
 fn spawn_pump(
