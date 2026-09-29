@@ -396,7 +396,8 @@ struct InputStream {
 #[derive(Default)]
 struct ControlState {
     controller: Option<Uuid>,
-    attached: std::collections::HashSet<Uuid>,
+    attached: HashMap<Uuid, u64>,
+    next_token: u64,
     grace_deadline: Option<Instant>,
 }
 
@@ -465,7 +466,7 @@ impl Session {
     fn controller_online(&self) -> bool {
         let control = self.control.lock().unwrap();
         match control.controller {
-            Some(stream) => control.attached.contains(&stream),
+            Some(stream) => control.attached.contains_key(&stream),
             None => false,
         }
     }
@@ -474,7 +475,7 @@ impl Session {
         let mut control = self.control.lock().unwrap();
         let expired = match (control.controller, control.grace_deadline) {
             (Some(stream), Some(deadline))
-                if !control.attached.contains(&stream) && Instant::now() >= deadline =>
+                if !control.attached.contains_key(&stream) && Instant::now() >= deadline =>
             {
                 control.controller = None;
                 control.grace_deadline = None;
@@ -878,9 +879,11 @@ impl SessionManager {
         resume_from: Option<u64>,
     ) -> Result<Attachment> {
         let session = self.get(session_id)?;
-        let (has_control, gained, controller) = {
+        let (has_control, gained, controller, token) = {
             let mut control = session.control.lock().unwrap();
-            control.attached.insert(stream_id);
+            control.next_token = control.next_token.wrapping_add(1);
+            let token = control.next_token;
+            control.attached.insert(stream_id, token);
             let gained = match control.controller {
                 Some(current) if current == stream_id => {
                     control.grace_deadline = None;
@@ -897,6 +900,7 @@ impl SessionManager {
                 control.controller == Some(stream_id),
                 gained,
                 control.controller,
+                token,
             )
         };
         let input_next = {
@@ -944,6 +948,7 @@ impl SessionManager {
             has_control,
             input_next,
             resumed,
+            token,
             subscription,
             events,
         })
@@ -955,12 +960,14 @@ impl SessionManager {
         Ok(subscription_for(&session, from))
     }
 
-    pub fn detach(&self, session_id: Uuid, stream_id: Uuid) -> Result<()> {
+    pub fn detach(&self, session_id: Uuid, stream_id: Uuid, token: u64) -> Result<()> {
         let session = self.get(session_id)?;
         let mut control = session.control.lock().unwrap();
-        if !control.attached.remove(&stream_id) {
-            bail!("stream is not attached to this session");
+        // 新连接已取代旧连接时，旧 Worker 的迟到清理不得让新连接离线。
+        if control.attached.get(&stream_id) != Some(&token) {
+            return Ok(());
         }
+        control.attached.remove(&stream_id);
         if control.controller == Some(stream_id) {
             // 保留控制权一个宽限期；由回收线程在到期后广播释放。
             control.grace_deadline = Some(Instant::now() + self.inner.control_grace);
@@ -972,7 +979,7 @@ impl SessionManager {
         let session = self.get(session_id)?;
         let changed = {
             let mut control = session.control.lock().unwrap();
-            if !control.attached.contains(&stream_id) {
+            if !control.attached.contains_key(&stream_id) {
                 bail!("stream is not attached to this session");
             }
             let changed = control.controller != Some(stream_id);
@@ -1037,7 +1044,7 @@ impl SessionManager {
         };
         let control = session.control.lock().unwrap();
         let is_controller =
-            control.controller == Some(stream_id) && control.attached.contains(&stream_id);
+            control.controller == Some(stream_id) && control.attached.contains_key(&stream_id);
         let mut streams = session.input_streams.lock().unwrap();
         if !streams.contains_key(&stream_id) && !is_controller {
             // 被 LRU 淘汰的观察流从它的首个帧偏移重新建条目，不强制回到零。
@@ -1171,7 +1178,7 @@ impl SessionManager {
 
     fn require_controller(&self, session: &Session, stream_id: Uuid) -> Result<()> {
         let control = session.control.lock().unwrap();
-        if control.controller != Some(stream_id) || !control.attached.contains(&stream_id) {
+        if control.controller != Some(stream_id) || !control.attached.contains_key(&stream_id) {
             bail!("stream is not the controlling client of this session");
         }
         Ok(())
@@ -1189,6 +1196,7 @@ pub struct Attachment {
     pub has_control: bool,
     pub input_next: u64,
     pub resumed: bool,
+    pub token: u64,
     pub subscription: Subscription,
     pub events: broadcast::Receiver<Event>,
 }
@@ -1796,6 +1804,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_attachment_token_cannot_detach_replacement() {
+        let mgr = SessionManager::new().unwrap();
+        let fake = fake_session(&mgr);
+        let stream = Uuid::new_v4();
+        let old = mgr.attach(fake.session.id, stream, 0, None).unwrap();
+        let new = mgr.attach(fake.session.id, stream, 0, None).unwrap();
+        assert_ne!(old.token, new.token);
+        mgr.detach(fake.session.id, stream, old.token).unwrap();
+        assert!(fake.session.controller_online());
+        assert!(matches!(
+            mgr.input(fake.session.id, stream, 0, b"ok"),
+            InputOutcome::Ack { next: 2 }
+        ));
+        mgr.detach(fake.session.id, stream, new.token).unwrap();
+        assert!(!fake.session.controller_online());
+    }
+
+    #[tokio::test]
     async fn controller_grace_period() {
         let mgr = SessionManager::with_control_grace(Duration::from_millis(200)).unwrap();
         let fake = fake_session(&mgr);
@@ -1803,12 +1829,10 @@ mod tests {
         let second = Uuid::new_v4();
         let third = Uuid::new_v4();
 
-        assert!(
-            mgr.attach(fake.session.id, first, 0, None)
-                .unwrap()
-                .has_control
-        );
-        mgr.detach(fake.session.id, first).unwrap();
+        let first_attachment = mgr.attach(fake.session.id, first, 0, None).unwrap();
+        assert!(first_attachment.has_control);
+        mgr.detach(fake.session.id, first, first_attachment.token)
+            .unwrap();
         // 宽限期内其他 stream 挂接不会自动获得控制权。
         assert!(
             !mgr.attach(fake.session.id, second, 0, None)
@@ -1816,12 +1840,9 @@ mod tests {
                 .has_control
         );
         // 同一 stream 重新挂接立即恢复控制。
-        assert!(
-            mgr.attach(fake.session.id, first, 0, None)
-                .unwrap()
-                .has_control
-        );
-        mgr.detach(fake.session.id, first).unwrap();
+        let renewed = mgr.attach(fake.session.id, first, 0, None).unwrap();
+        assert!(renewed.has_control);
+        mgr.detach(fake.session.id, first, renewed.token).unwrap();
         // 宽限期结束后释放控制权，下一次挂接可取得。
         assert!(wait_until(Duration::from_secs(5), || {
             mgr.list()[0].controller.is_none()

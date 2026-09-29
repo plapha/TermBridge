@@ -86,7 +86,7 @@ struct Worker {
     shared: Arc<Shared>,
     channel: ChannelId,
     handle: server::Handle,
-    attached: HashMap<Uuid, Uuid>,
+    attached: HashMap<Uuid, (Uuid, u64)>,
     tasks: HashMap<Uuid, tokio::task::JoinHandle<()>>,
 }
 
@@ -116,7 +116,7 @@ impl Worker {
     }
 
     fn stream_for(&self, session_id: Uuid) -> Option<Uuid> {
-        self.attached.get(&session_id).copied()
+        self.attached.get(&session_id).map(|(stream, _)| *stream)
     }
 
     async fn blocking<F>(&self, id: Uuid, f: F) -> Result<(), ()>
@@ -163,12 +163,13 @@ impl Worker {
                 let Some(stream_id) = self.stream_for(session_id) else {
                     return self.error(id, "not_attached", "尚未挂接到该会话").await;
                 };
-                self.attached.remove(&session_id);
+                let (_, token) = self.attached.remove(&session_id).unwrap();
                 if let Some(task) = self.tasks.remove(&session_id) {
                     task.abort();
                 }
                 self.blocking(id, move |m| {
-                    m.detach(session_id, stream_id).map(|_| Response::Accepted)
+                    m.detach(session_id, stream_id, token)
+                        .map(|_| Response::Accepted)
                 })
                 .await
             }
@@ -232,11 +233,19 @@ impl Worker {
             Ok(attachment) => attachment,
             Err(e) => return self.error(id, "attach_failed", e.to_string()).await,
         };
-        // 同一连接对同一会话重复挂接：替换旧的转发任务。
+        // 新挂接已得到新令牌；旧流（即使是不同 stream）必须解除，
+        // 同一 stream 的旧令牌清理则由 host 安全忽略。
         if let Some(task) = self.tasks.remove(&session_id) {
             task.abort();
         }
-        self.attached.insert(session_id, stream_id);
+        if let Some((old_stream, old_token)) = self.attached.remove(&session_id) {
+            let _ = self
+                .shared
+                .manager
+                .detach(session_id, old_stream, old_token);
+        }
+        self.attached
+            .insert(session_id, (stream_id, attachment.token));
         let body = Response::Attached {
             session: attachment.session.clone(),
             has_control: attachment.has_control,
@@ -259,8 +268,8 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        for (session_id, stream_id) in self.attached.drain() {
-            let _ = self.shared.manager.detach(session_id, stream_id);
+        for (session_id, (stream_id, token)) in self.attached.drain() {
+            let _ = self.shared.manager.detach(session_id, stream_id, token);
         }
         for (_, task) in self.tasks.drain() {
             task.abort();

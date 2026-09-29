@@ -765,4 +765,157 @@ mod tests {
         server.await.unwrap().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
+    #[tokio::test]
+    async fn replacement_connection_and_stream_survive_old_worker_cleanup() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("termbridge-attachment-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        std::env::set_var("LOCALAPPDATA", &dir);
+        #[cfg(not(windows))]
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let secret = Uuid::new_v4().to_string();
+        let host = config::init_host(&secret).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(server::run_on_listener(host.clone(), listener, async {
+            let _ = rx.await;
+        }));
+        let fp = client::probe_host("127.0.0.1", port).await.unwrap();
+        let connect = || {
+            client::ClientConfig::new(
+                "127.0.0.1",
+                port,
+                host.username.clone(),
+                client::AuthMethod::Password {
+                    password: secret.clone(),
+                },
+                fp.clone(),
+            )
+        };
+        let mut first = client::Client::connect(connect()).await.unwrap();
+        let mut second = client::Client::connect(connect()).await.unwrap();
+        let Response::Created { session } = first
+            .request(Request::Create {
+                title: "token".into(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("create failed")
+        };
+        let sid = session.id;
+        let stream1 = Uuid::new_v4();
+        first
+            .request(Request::Attach {
+                session_id: sid,
+                stream_id: stream1,
+                input_base: 0,
+                resume_from: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            second
+                .request(Request::Attach {
+                    session_id: sid,
+                    stream_id: stream1,
+                    input_base: 0,
+                    resume_from: Some(0)
+                })
+                .await
+                .unwrap(),
+            Response::Attached {
+                has_control: true,
+                ..
+            }
+        ));
+        first.disconnect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        second.send_input(sid, stream1, 0, b"x").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match second.recv_event().await {
+                    Some(Event::InputAck {
+                        session_id,
+                        stream_id,
+                        offset: 1,
+                    }) if session_id == sid && stream_id == stream1 => break,
+                    Some(Event::InputRejected { code, .. }) => {
+                        panic!("replacement rejected: {code}")
+                    }
+                    Some(_) => {}
+                    None => panic!("replacement disconnected"),
+                }
+            }
+        })
+        .await
+        .expect("replacement was detached by old Worker");
+        let stream2 = Uuid::new_v4();
+        second
+            .request(Request::Attach {
+                session_id: sid,
+                stream_id: stream2,
+                input_base: 0,
+                resume_from: Some(0),
+            })
+            .await
+            .unwrap();
+        second.send_input(sid, stream1, 1, b"y").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match second.recv_event().await {
+                    Some(Event::InputRejected {
+                        session_id,
+                        stream_id,
+                        code,
+                        ..
+                    }) if session_id == sid && stream_id == stream1 && code == "not_controller" => {
+                        break
+                    }
+                    Some(Event::InputAck {
+                        session_id,
+                        stream_id,
+                        ..
+                    }) if session_id == sid && stream_id == stream1 => {
+                        panic!("old stream still online")
+                    }
+                    Some(_) => {}
+                    None => panic!("disconnected"),
+                }
+            }
+        })
+        .await
+        .expect("old stream was not detached");
+        assert!(matches!(
+            second
+                .request(Request::TakeControl { session_id: sid })
+                .await
+                .unwrap(),
+            Response::Accepted
+        ));
+        second.send_input(sid, stream2, 0, b"z").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match second.recv_event().await {
+                    Some(Event::InputAck {
+                        session_id,
+                        stream_id,
+                        offset: 1,
+                    }) if session_id == sid && stream_id == stream2 => break,
+                    Some(_) => {}
+                    None => panic!("disconnected"),
+                }
+            }
+        })
+        .await
+        .expect("new stream was not usable");
+        second.disconnect().await.unwrap();
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
