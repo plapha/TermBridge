@@ -452,7 +452,7 @@ impl server::Handler for HostServer {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         let Some(requests) = self
             .requests
@@ -520,11 +520,7 @@ impl server::Handler for HostServer {
                     };
                     let line = encode(&Frame::Event { body: event })
                         .map_err(|_| russh::Error::Disconnect)?;
-                    let handle = self.handle.clone().ok_or(russh::Error::Disconnect)?;
-                    handle
-                        .data(channel, line)
-                        .await
-                        .map_err(|_| russh::Error::Disconnect)?;
+                    session.data(channel, line)?;
                 }
                 Ok(_) | Err(_) => return Err(russh::Error::Disconnect),
             }

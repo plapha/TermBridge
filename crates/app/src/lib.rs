@@ -514,4 +514,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&key_dir);
     }
 
+    #[tokio::test]
+    async fn input_ack_survives_sustained_output() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("termbridge-flood-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        std::env::set_var("LOCALAPPDATA", &dir);
+        #[cfg(not(windows))]
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let secret = Uuid::new_v4().to_string();
+        let host = config::init_host(&secret).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(server::run_on_listener(host.clone(), listener, async {
+            let _ = rx.await;
+        }));
+        let fp = client::probe_host("127.0.0.1", port).await.unwrap();
+        let mut client = client::Client::connect(client::ClientConfig::new(
+            "127.0.0.1",
+            port,
+            host.username,
+            client::AuthMethod::Password { password: secret },
+            fp,
+        ))
+        .await
+        .unwrap();
+        let Response::Created { session } = client
+            .request(Request::Create {
+                title: "flood".into(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("create failed")
+        };
+        let sid = session.id;
+        let stream = Uuid::new_v4();
+        assert!(matches!(
+            client
+                .request(Request::Attach {
+                    session_id: sid,
+                    stream_id: stream,
+                    input_base: 0,
+                    resume_from: None,
+                })
+                .await
+                .unwrap(),
+            Response::Attached {
+                has_control: true,
+                ..
+            }
+        ));
+        let _ = read_snapshot(&mut client, sid).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        #[cfg(windows)]
+        let command = b"while($true){'x'*200}\r".as_slice();
+        #[cfg(not(windows))]
+        let command =
+            b"yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r".as_slice();
+        client.send_input(sid, stream, 0, command).await.unwrap();
+        let mut next = command.len() as u64;
+        let mut outputs = 0;
+        let mut responder = QueryResponder::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while outputs < 10 {
+                match client.recv_event().await {
+                    Some(Event::Output {
+                        session_id,
+                        data_b64,
+                        ..
+                    }) if session_id == sid => {
+                        outputs += 1;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data_b64)
+                            .unwrap();
+                        for reply in responder.push(&bytes) {
+                            client.send_input(sid, stream, next, &reply).await.unwrap();
+                            next += reply.len() as u64;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("disconnected during output"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("command did not produce sustained output: {outputs} output events")
+        });
+        // 每次发送后等 ACK：旧的 handler 在已满的 Handle 队列里等待自身排空会卡死。
+        for _ in 0..50 {
+            client.send_input(sid, stream, next, b"z").await.unwrap();
+            next += 1;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match client.recv_event().await {
+                        Some(Event::InputAck {
+                            session_id,
+                            stream_id,
+                            offset,
+                        }) if session_id == sid && stream_id == stream && offset == next => break,
+                        Some(Event::InputRejected { code, .. }) => panic!("input rejected: {code}"),
+                        Some(_) => {}
+                        None => panic!("disconnected while awaiting ACK"),
+                    }
+                }
+            })
+            .await
+            .expect("InputAck stalled under output pressure");
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), client.request(Request::List))
+                .await
+                .expect("List stalled under output pressure")
+                .unwrap(),
+            Response::Sessions { .. }
+        ));
+        client.send_input(sid, stream, next, b"\x03").await.unwrap();
+        client.disconnect().await.unwrap();
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
