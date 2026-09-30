@@ -19,8 +19,7 @@ async fn cli_raw_attach_round_trip() {
 
     // 嵌套 CLI 使用的私钥；host2 用对应公钥认证。
     let key =
-        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
-            .unwrap();
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
     let private_path = dir_nested.join("id_ed25519");
     std::fs::write(
         &private_path,
@@ -149,7 +148,7 @@ async fn cli_raw_attach_round_trip() {
 
     // 在 S1 里运行嵌套 CLI attach 到 S2。
     let launch = format!(
-        "& '{}' session attach -p p2 --session-id {}\r",
+        "& '{}' --lang en session attach -p p2 --session-id {}\r",
         exe.display(),
         s2.id
     );
@@ -163,7 +162,7 @@ async fn cli_raw_attach_round_trip() {
             s1.id,
             t1,
             &mut outer_tracker,
-            "已附加到",
+            "Attached to",
             Duration::from_secs(25),
             &mut outer_input
         )
@@ -224,7 +223,7 @@ async fn cli_raw_attach_round_trip() {
             &mut c1,
             s1.id,
             &mut outer_tracker,
-            "已退出 raw 模式",
+            "left raw mode",
             Duration::from_secs(15)
         )
         .await,

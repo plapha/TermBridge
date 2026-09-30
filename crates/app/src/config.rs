@@ -120,7 +120,10 @@ fn ssh_dir() -> Result<PathBuf> {
     let home = std::env::var_os("USERPROFILE");
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME");
-    Ok(PathBuf::from(home.context("无法确定用户主目录")?).join(".ssh"))
+    Ok(PathBuf::from(home.with_context(|| {
+        crate::tr!("Cannot determine the home directory", "无法确定用户主目录")
+    })?)
+    .join(".ssh"))
 }
 
 /// 检查私钥是否需要口令；不读取或返回私钥明文给调用方。
@@ -128,13 +131,24 @@ pub fn key_passphrase_required(path: &Path) -> Result<bool> {
     match russh::keys::load_secret_key(path, None) {
         Ok(_) => Ok(false),
         Err(russh::keys::Error::KeyIsEncrypted) => Ok(true),
-        Err(e) => Err(e).with_context(|| format!("无法读取私钥 {}", path.display())),
+        Err(e) => Err(e).with_context(|| {
+            crate::tr!(
+                "Cannot read private key {}",
+                "无法读取私钥 {}",
+                path.display()
+            )
+        }),
     }
 }
 
 pub fn validate_private_key(path: &Path, passphrase: Option<&str>) -> Result<()> {
-    russh::keys::load_secret_key(path, passphrase)
-        .with_context(|| format!("无法读取私钥 {}", path.display()))?;
+    russh::keys::load_secret_key(path, passphrase).with_context(|| {
+        crate::tr!(
+            "Cannot read private key {}",
+            "无法读取私钥 {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 /// 显式选择复用 SSH 授权密钥时的默认来源；不会自动授予访问权。
@@ -151,7 +165,10 @@ pub fn default_ssh_private_key_path() -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    bail!("未发现 ~/.ssh/id_ed25519、id_ecdsa 或 id_rsa；请显式提供 --key-path")
+    bail!(crate::tr!(
+        "No ~/.ssh/id_ed25519, id_ecdsa or id_rsa found; pass --key-path explicitly",
+        "未发现 ~/.ssh/id_ed25519、id_ecdsa 或 id_rsa；请显式提供 --key-path"
+    ))
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
@@ -232,7 +249,8 @@ pub fn parse_authorized_keys(text: &str) -> Result<Vec<String>> {
             continue;
         }
         let mut key = PublicKey::from_openssh(line).with_context(|| {
-            format!(
+            crate::tr!(
+                "Line {} of the authorized keys file is not supported; remove option lines or provide plain public keys",
                 "授权公钥文件第 {} 行不受支持；请移除选项行或提供纯公钥",
                 index + 1
             )
@@ -244,7 +262,10 @@ pub fn parse_authorized_keys(text: &str) -> Result<Vec<String>> {
         }
     }
     if keys.is_empty() {
-        bail!("授权公钥文件没有有效密钥，拒绝启用无认证的接收端");
+        bail!(crate::tr!(
+            "The authorized keys file has no valid keys; refusing to enable a host without authentication",
+            "授权公钥文件没有有效密钥，拒绝启用无认证的接收端"
+        ));
     }
     Ok(keys)
 }
@@ -252,7 +273,10 @@ pub fn parse_authorized_keys(text: &str) -> Result<Vec<String>> {
 /// 兼容原来的产品专用密码初始化方式。
 pub fn init_host(password: &str) -> Result<HostConfig> {
     if password.len() < 12 {
-        bail!("接收密码至少需要 12 个字符");
+        bail!(crate::tr!(
+            "The host password must be at least 12 characters",
+            "接收密码至少需要 12 个字符"
+        ));
     }
     init_host_inner(Some(password), Vec::new())
 }
@@ -265,10 +289,16 @@ pub fn init_host_with_keys(authorized_keys_text: &str) -> Result<HostConfig> {
 
 fn init_host_inner(password: Option<&str>, authorized_keys: Vec<String>) -> Result<HostConfig> {
     if password.is_none() && authorized_keys.is_empty() {
-        bail!("接收端至少需要一种认证方式");
+        bail!(crate::tr!(
+            "The host needs at least one authentication method",
+            "接收端至少需要一种认证方式"
+        ));
     }
     if host_path().exists() || host_key_path().exists() {
-        bail!("接收端已初始化，拒绝覆盖主机密钥");
+        bail!(crate::tr!(
+            "The host is already initialized; refusing to overwrite the host key",
+            "接收端已初始化，拒绝覆盖主机密钥"
+        ));
     }
     fs::create_dir_all(config_dir())?;
     let key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
@@ -287,13 +317,18 @@ fn init_host_inner(password: Option<&str>, authorized_keys: Vec<String>) -> Resu
             let salt = SaltString::generate(&mut rand_core::OsRng);
             Ok(Argon2::default()
                 .hash_password(password.as_bytes(), &salt)
-                .map_err(|e| anyhow::anyhow!("密码哈希失败: {e}"))?
+                .map_err(|e| {
+                    anyhow::anyhow!(crate::tr!(
+                        "Password hashing failed: {e}",
+                        "密码哈希失败: {e}"
+                    ))
+                })?
                 .to_string())
         })
         .transpose()?;
     let username = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
-        .context("无法确定本机用户名")?;
+        .with_context(|| crate::tr!("Cannot determine the local username", "无法确定本机用户名"))?;
     let config = HostConfig {
         username,
         password_hash,

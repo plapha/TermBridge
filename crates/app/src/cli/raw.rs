@@ -19,6 +19,14 @@ use uuid::Uuid;
 
 use super::expect_response;
 use crate::client::{Client, InputBuffer, InputRecovery};
+use crate::tr;
+
+/// 状态行 `\r\n[文本]`：raw 模式下换行需要显式回车；文本按当前语言选择。
+macro_rules! note {
+    ($($t:tt)*) => {
+        eprintln!("\r\n[{}]", tr!($($t)*))
+    };
+}
 
 const ESCAPE: u8 = 0x1d;
 
@@ -32,7 +40,10 @@ enum InputEvent {
 
 pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result<()> {
     if !std::io::stdin().is_terminal() {
-        bail!("session attach 需要真实终端；不支持管道输入");
+        bail!(tr!(
+            "session attach needs a real terminal; piped input is not supported",
+            "session attach 需要真实终端；不支持管道输入"
+        ));
     }
     let session_id = resolve_session(client, session_id).await?;
     let stream_id = Uuid::new_v4();
@@ -54,7 +65,10 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
         ..
     } = resp
     else {
-        bail!("attach 返回了意外响应");
+        bail!(tr!(
+            "attach returned an unexpected response",
+            "attach 返回了意外响应"
+        ));
     };
 
     let mut guard = RawModeGuard::enable()?;
@@ -65,11 +79,22 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
     let mut end_armed: Option<Instant> = None;
 
     eprintln!(
-        "已附加到 {}（{}）。Ctrl+] d 断开 | Ctrl+] e 结束（需确认） | Ctrl+] t 接管 | Ctrl+] Ctrl+] 发送字面 Ctrl+]",
-        session.id, session.title
+        "{}",
+        tr!(
+            "Attached to {} ({}). Ctrl+] d detach | Ctrl+] e end (asks to confirm) | Ctrl+] t take control | Ctrl+] Ctrl+] send a literal Ctrl+]",
+            "已附加到 {}（{}）。Ctrl+] d 断开 | Ctrl+] e 结束（需确认） | Ctrl+] t 接管 | Ctrl+] Ctrl+] 发送字面 Ctrl+]",
+            session.id,
+            session.title
+        )
     );
     if !is_controller {
-        eprintln!("当前为观察模式：按键不会发送；按 Ctrl+] t 接管。");
+        eprintln!(
+            "{}",
+            tr!(
+                "Observer mode: keystrokes are not sent; press Ctrl+] t to take control.",
+                "当前为观察模式：按键不会发送；按 Ctrl+] t 接管。"
+            )
+        );
     }
 
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputEvent>(64);
@@ -86,7 +111,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                 let ev = match ev {
                     Ok(ev) => ev,
                     Err(_) => {
-                        eprintln!("\r\n[事件缓冲已溢出，按已显示偏移重新挂接]");
+                        note!("event buffer overflowed; reattaching from the displayed offset", "事件缓冲已溢出，按已显示偏移重新挂接");
                         match reattach(client, session_id, stream_id,
                             input_buffer.acked(), displayed).await {
                             Ok((resumed, next)) => {
@@ -99,18 +124,18 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                     }
                 };
                 let Some(ev) = ev else {
-                    eprintln!("\r\n[连接已断开，不再重发请求]");
+                    note!("connection lost; requests are not resent", "连接已断开，不再重发请求");
                     break Ok(());
                 };
                 match ev {
                     Event::SnapshotBegin { session_id: sid, offset: snap_offset, .. } if sid == session_id => {
                         pending_snapshot = Some(snap_offset);
                         displayed = None;
-                        write_stdout(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H").context("终端输出失败")?;
+                        write_stdout(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H").with_context(|| tr!("Failed to write terminal output", "终端输出失败"))?;
                     }
                     Event::SnapshotChunk { session_id: sid, data_b64 } if sid == session_id => {
                         if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&data_b64) {
-                            write_stdout(&data).context("终端输出失败")?;
+                            write_stdout(&data).with_context(|| tr!("Failed to write terminal output", "终端输出失败"))?;
                         }
                     }
                     Event::SnapshotEnd { session_id: sid } if sid == session_id => {
@@ -123,7 +148,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                         match displayed {
                             None => {}
                             Some(current) if out_offset > current => {
-                                eprintln!("\r\n[检测到输出缺口，重新挂接]");
+                                note!("output gap detected; reattaching", "检测到输出缺口，重新挂接");
                                 match reattach(client, session_id, stream_id, input_buffer.next(), Some(current)).await {
                                     Ok((resumed, next_input)) => {
                                         input_buffer.align_attach(next_input);
@@ -141,7 +166,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                                 let end = out_offset + data.len() as u64;
                                 if end > current {
                                     let skip = (current - out_offset) as usize;
-                                    write_stdout(&data[skip..]).context("终端输出失败")?;
+                                    write_stdout(&data[skip..]).with_context(|| tr!("Failed to write terminal output", "终端输出失败"))?;
                                     displayed = Some(end);
                                 }
                             }
@@ -152,7 +177,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                     Event::InputRejected { session_id: sid, stream_id: st, code, offset: at, .. }
                         if sid == session_id && st == stream_id => {
                         match input_buffer.rejected(&code, at) {
-                            InputRecovery::Consumed => eprintln!("\r\n[观察模式，按键未发送]"),
+                            InputRecovery::Consumed => note!("observer mode: keystrokes not sent", "观察模式，按键未发送"),
                             InputRecovery::Retry { offset, data, delay } => {
                                 if !delay.is_zero() { tokio::time::sleep(delay).await; }
                                 for (index, chunk) in data.chunks(MAX_INPUT_CHUNK).enumerate() {
@@ -163,7 +188,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                                 }
                             }
                             InputRecovery::Reattach { input_base } => {
-                                eprintln!("\r\n[输入状态未知，丢弃未确认字节并重新挂接]");
+                                note!("input state unknown; discarding unacknowledged bytes and reattaching", "输入状态未知，丢弃未确认字节并重新挂接");
                                 let (_, next) = reattach(client, session_id, stream_id,
                                     input_base, displayed).await?;
                                 input_buffer.align_attach(next);
@@ -172,20 +197,20 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                         }
                     }
                     Event::Resized { session_id: sid, rows, cols } if sid == session_id => {
-                        eprintln!("\r\n[远端尺寸: {cols}x{rows}]");
+                        note!("remote size: {cols}x{rows}", "远端尺寸: {cols}x{rows}");
                     }
                     Event::ControlChanged { session_id: sid, controller } if sid == session_id => {
                         is_controller = controller == Some(stream_id);
                         let name = controller
                             .map(|c| c.to_string()[..8].to_string())
-                            .unwrap_or_else(|| "无".into());
-                        eprintln!("\r\n[控制权变更: {name}]");
+                            .unwrap_or_else(|| tr!("none", "无"));
+                        note!("control changed: {name}", "控制权变更: {name}");
                         if is_controller {
                             send_local_size(client, session_id).await;
                         }
                     }
                     Event::Ended { session_id: sid } if sid == session_id => {
-                        eprintln!("\r\n[会话已结束]");
+                        note!("session ended", "会话已结束");
                         break Ok(());
                     }
                     _ => {}
@@ -194,16 +219,22 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
             input = input_rx.recv() => match input {
                 Some(InputEvent::Data(bytes)) => {
                     if !is_controller {
-                        eprintln!("\r\n[观察模式，按键未发送；Ctrl+] t 接管]");
+                        note!("observer mode: keystrokes not sent; Ctrl+] t to take control", "观察模式，按键未发送；Ctrl+] t 接管");
                         continue;
                     }
                     for chunk in bytes.chunks(MAX_INPUT_CHUNK) {
                         let Some(at) = input_buffer.queue(chunk) else {
-                            eprintln!("\r\n[未确认输入缓冲已满，拒绝本地按键]\x07");
+                            eprintln!(
+                                "\r\n[{}]\x07",
+                                tr!(
+                                    "unacknowledged input buffer is full; keystroke rejected",
+                                    "未确认输入缓冲已满，拒绝本地按键"
+                                )
+                            );
                             break;
                         };
                         if client.send_input(session_id, stream_id, at, chunk).await.is_err() {
-                            eprintln!("\r\n[连接已断开，状态未知的输入不会盲目重发]");
+                            note!("connection lost; input of unknown state will not be blindly resent", "连接已断开，状态未知的输入不会盲目重发");
                             break;
                         }
                     }
@@ -212,10 +243,10 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                     match client.request(Request::Detach { session_id }).await {
                         Ok(resp) => {
                             if let Err(e) = expect_response(resp, "detach") {
-                                eprintln!("\r\n[未脱离: {e}]");
+                                note!("not detached: {e}", "未脱离: {e}");
                             }
                         }
-                        Err(_) => eprintln!("\r\n[连接已断开，本地脱离]"),
+                        Err(_) => note!("connection lost; detached locally", "连接已断开，本地脱离"),
                     }
                     break Ok(());
                 }
@@ -228,28 +259,28 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
                         match client.request(Request::End { session_id }).await {
                             Ok(resp) => {
                                 if let Err(e) = expect_response(resp, "end") {
-                                    eprintln!("\r\n[未结束: {e}]");
+                                    note!("not ended: {e}", "未结束: {e}");
                                 }
                             }
-                            Err(_) => eprintln!("\r\n[连接已断开，未发送 end]"),
+                            Err(_) => note!("connection lost; end was not sent", "连接已断开，未发送 end"),
                         }
                         break Ok(());
                     }
                     end_armed = Some(now);
-                    eprintln!("\r\n[3 秒内再按一次 Ctrl+] e 确认结束会话]");
+                    note!("press Ctrl+] e again within 3 seconds to confirm ending the session", "3 秒内再按一次 Ctrl+] e 确认结束会话");
                 }
                 Some(InputEvent::Take) => match client.request(Request::TakeControl { session_id }).await {
                     Ok(resp) => {
                         if let Err(e) = expect_response(resp, "take") {
-                            eprintln!("\r\n[未获取: {e}]");
+                            note!("control not taken: {e}", "未获取: {e}");
                         } else {
-                            eprintln!("\r\n[已获取控制权]");
+                            note!("control taken", "已获取控制权");
                             is_controller = true;
                             send_local_size(client, session_id).await;
                         }
                     }
                     Err(_) => {
-                        eprintln!("\r\n[连接已断开，不再重发]");
+                        note!("connection lost; nothing is resent", "连接已断开，不再重发");
                         break Ok(());
                     }
                 },
@@ -264,7 +295,7 @@ pub async fn attach_raw(client: &mut Client, session_id: Option<Uuid>) -> Result
     };
 
     guard.restore();
-    eprintln!("\r\n[已退出 raw 模式]");
+    note!("left raw mode", "已退出 raw 模式");
     result
 }
 
@@ -274,13 +305,21 @@ async fn resolve_session(client: &mut Client, session_id: Option<Uuid>) -> Resul
         None => {
             let resp = expect_response(client.request(Request::List).await?, "list")?;
             let Response::Sessions { sessions } = resp else {
-                bail!("list 返回了意外响应");
+                bail!(tr!(
+                    "list returned an unexpected response",
+                    "list 返回了意外响应"
+                ));
             };
             sessions
                 .into_iter()
                 .find(|s| s.live)
                 .map(|s| s.id)
-                .context("没有活跃会话，请先用 session create 创建")
+                .with_context(|| {
+                    tr!(
+                        "No live session; create one with session create first",
+                        "没有活跃会话，请先用 session create 创建"
+                    )
+                })
         }
     }
 }
@@ -302,7 +341,7 @@ async fn reattach(
                 resume_from,
             })
             .await?,
-        "重新挂接",
+        "reattach",
     )?;
     let Response::Attached {
         resumed,
@@ -310,7 +349,10 @@ async fn reattach(
         ..
     } = resp
     else {
-        bail!("重新挂接返回了意外响应");
+        bail!(tr!(
+            "reattach returned an unexpected response",
+            "重新挂接返回了意外响应"
+        ));
     };
     Ok((resumed, input_next))
 }
@@ -658,7 +700,8 @@ impl RawModeGuard {
         install_panic_hook();
         #[cfg(unix)]
         {
-            crossterm::terminal::enable_raw_mode().context("无法进入 raw 模式")?;
+            crossterm::terminal::enable_raw_mode()
+                .with_context(|| tr!("Cannot enter raw mode", "无法进入 raw 模式"))?;
             *RESTORE_STATE.lock().unwrap() = Some(RestoreState::Unix);
         }
         #[cfg(windows)]

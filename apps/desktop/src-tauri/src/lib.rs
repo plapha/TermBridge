@@ -6,9 +6,27 @@
 mod commands;
 mod state;
 
+use termbridge::i18n::{self, Lang};
+use termbridge::tr;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
+
+/// 托盘菜单项；切换界面语言时更新文字。
+struct TrayItems {
+    show: MenuItem<tauri::Wry>,
+    stop: MenuItem<tauri::Wry>,
+}
+
+fn tray_labels() -> (String, String) {
+    (
+        tr!("Show TermBridge", "显示 TermBridge"),
+        tr!(
+            "Quit TermBridge (stops this GUI's host)",
+            "退出 TermBridge（停止本 GUI 接收端）"
+        ),
+    )
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,12 +54,15 @@ pub fn run() {
             commands::send_input,
             commands::resize_session,
             commands::take_control,
-            hide_to_tray
+            hide_to_tray,
+            set_language
         ])
         .setup(|app| {
-            let show = MenuItem::with_id(app, "show", "显示 TermBridge", true, None::<&str>)?;
-            let stop = MenuItem::with_id(app, "stop_host", "退出 TermBridge（停止本 GUI 接收端）", true, None::<&str>)?;
+            let (show_text, stop_text) = tray_labels();
+            let show = MenuItem::with_id(app, "show", show_text, true, None::<&str>)?;
+            let stop = MenuItem::with_id(app, "stop_host", stop_text, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &stop])?;
+            app.manage(TrayItems { show: show.clone(), stop: stop.clone() });
             TrayIconBuilder::with_id("termbridge-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("TermBridge")
@@ -96,8 +117,26 @@ pub fn run() {
 /// 隐藏主窗口到托盘（顶栏按钮调用）。
 #[tauri::command]
 fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
-    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| tr!("Main window not found", "主窗口不存在"))?;
     win.hide().map_err(|e| e.to_string())
+}
+
+/// 前端切换界面语言：后端消息与托盘菜单随之切换。
+#[tauri::command]
+fn set_language(app: tauri::AppHandle, lang: String) -> Result<(), String> {
+    let lang = Lang::parse(&lang).ok_or_else(|| format!("unsupported language: {lang}"))?;
+    i18n::set_lang(lang);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_title(&tr!("TermBridge Desktop Terminal", "TermBridge 桌面终端"));
+    }
+    let (show_text, stop_text) = tray_labels();
+    if let Some(items) = app.try_state::<TrayItems>() {
+        items.show.set_text(show_text).map_err(|e| e.to_string())?;
+        items.stop.set_text(stop_text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Windows：关闭 WebView2 的浏览器加速键（F5/Ctrl+R/Ctrl+W 等），

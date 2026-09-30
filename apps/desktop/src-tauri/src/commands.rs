@@ -15,6 +15,8 @@ use termbridge::config::{
     self, host_path, known_hosts_path, profiles_path, read_json, save_json, HostConfig, Profile,
     Profiles,
 };
+use termbridge::i18n::wire_message;
+use termbridge::tr;
 use termbridge_protocol::{Event, Request, Response, SessionInfo, MAX_INPUT_CHUNK};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -61,7 +63,7 @@ fn store_confirmed_fingerprint(host: &str, port: u16, fp: &str) -> IpcResult<()>
     if let Some(previous) = known.entries.get(&key) {
         if termbridge::client::HostFingerprint::new(previous.clone()).base64_part()
             != termbridge::client::HostFingerprint::new(fp.to_owned()).base64_part() {
-            return Err(ipc("已有指纹记录不同，拒绝覆盖"));
+            return Err(ipc(tr!("An existing fingerprint record differs; refusing to overwrite it", "已有指纹记录不同，拒绝覆盖")));
         }
     }
     known.entries.insert(key, fp.to_owned());
@@ -210,10 +212,10 @@ pub fn save_profile(draft: ProfileDraft) -> IpcResult<ProfileDto> {
     let auth = match draft.auth.as_str() {
         "password" => config::AuthKind::Password,
         "key" => config::AuthKind::Key,
-        other => return Err(ipc(format!("auth `{other}` 不受支持（仅 password / key）"))),
+        other => return Err(ipc(tr!("auth `{other}` is not supported (only password / key)", "auth `{other}` 不受支持（仅 password / key）"))),
     };
     if draft.port == 0 || draft.host.trim().is_empty() || draft.user.trim().is_empty() || draft.name.trim().is_empty() {
-        return Err(ipc("配置名称、主机、用户及有效端口均为必填"));
+        return Err(ipc(tr!("Profile name, host, user and a valid port are all required", "配置名称、主机、用户及有效端口均为必填")));
     }
     let key_path = if matches!(auth, config::AuthKind::Key) {
         Some(match draft.key_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -224,7 +226,7 @@ pub fn save_profile(draft: ProfileDraft) -> IpcResult<ProfileDto> {
     let mut profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     let editing_id = draft.id.as_deref().map(Uuid::parse_str).transpose().map_err(ipc)?;
     if profiles.items.iter().any(|p| p.name == draft.name && Some(p.id) != editing_id) {
-        return Err(ipc("连接配置名称已存在"));
+        return Err(ipc(tr!("A profile with this name already exists", "连接配置名称已存在")));
     }
     let mut clear_password = None;
     let profile = match editing_id {
@@ -233,7 +235,7 @@ pub fn save_profile(draft: ProfileDraft) -> IpcResult<ProfileDto> {
                 .items
                 .iter_mut()
                 .find(|p| p.id == id)
-                .ok_or_else(|| ipc("档案不存在"))?;
+                .ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
             // 主机、端口、用户或认证方式变化时，不能复用旧目标的已记住密码。
             let identity_changed = existing.host != draft.host || existing.port != draft.port
                 || existing.user != draft.user
@@ -280,7 +282,7 @@ pub fn remove_profile(id: String) -> IpcResult<()> {
     let before = profiles.items.len();
     profiles.items.retain(|p| p.id != uid);
     if profiles.items.len() == before {
-        return Err(ipc("档案不存在"));
+        return Err(ipc(tr!("Profile not found", "档案不存在")));
     }
     save_json(&profiles_path(), &profiles).map_err(ipc)?;
     // 尽力删除记住的密码；凭据库不可用时忽略。
@@ -294,9 +296,9 @@ pub fn remove_profile(id: String) -> IpcResult<()> {
 pub fn store_profile_password(profile_id: String, password: String) -> IpcResult<()> {
     let uid = Uuid::parse_str(&profile_id).map_err(ipc)?;
     let mut profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
-    let profile = profiles.items.iter_mut().find(|p| p.id == uid).ok_or_else(|| ipc("档案不存在"))?;
+    let profile = profiles.items.iter_mut().find(|p| p.id == uid).ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
     if !matches!(profile.auth, config::AuthKind::Password) || password.is_empty() {
-        return Err(ipc("仅密码认证档案可保存非空密码"));
+        return Err(ipc(tr!("Only password-authenticated profiles can store a non-empty password", "仅密码认证档案可保存非空密码")));
     }
     keyring_entry(&profile_id.clone())
         .and_then(|e| e.set_password(&password).map_err(|e| e.to_string()))
@@ -354,7 +356,7 @@ pub fn init_host(app: tauri::AppHandle, password: Option<String>, authorized_key
             let text = std::fs::read_to_string(&path).map_err(ipc)?;
             config::init_host_with_keys(&text).map_err(ipc)?;
         }
-        _ => return Err(ipc("请只选择一种初始化方式：产品密码或现有 SSH 授权公钥")),
+        _ => return Err(ipc(tr!("Choose exactly one initialization method: a separate password or existing SSH authorized keys", "请只选择一种初始化方式：产品密码或现有 SSH 授权公钥"))),
     }
     host_status(app)
 }
@@ -364,9 +366,9 @@ pub fn init_host(app: tauri::AppHandle, password: Option<String>, authorized_key
 pub fn switch_host_to_keys(app: tauri::AppHandle, authorized_keys_path: String) -> IpcResult<HostStatus> {
     let state: tauri::State<AppState> = app.state();
     if state.host_running.load(Ordering::SeqCst) {
-        return Err(ipc("请先点击“停止本应用接收”，再切换认证方式；运行中的会话不会被偷偷结束"));
+        return Err(ipc(tr!("Stop the local receiver first, then switch the authentication method; running sessions are never ended silently", "请先点击“停止本应用接收”，再切换认证方式；运行中的会话不会被偷偷结束")));
     }
-    let mut config = read_host_config()?.ok_or_else(|| ipc("接收端未初始化"))?;
+    let mut config = read_host_config()?.ok_or_else(|| ipc(tr!("The host is not initialized", "接收端未初始化")))?;
     let path = if authorized_keys_path.trim().is_empty() {
         config::default_ssh_authorized_keys_path().map_err(ipc)?
     } else { std::path::PathBuf::from(authorized_keys_path.trim()) };
@@ -378,13 +380,13 @@ pub fn switch_host_to_keys(app: tauri::AppHandle, authorized_keys_path: String) 
 #[tauri::command]
 pub async fn set_host_enabled(app: tauri::AppHandle, enabled: bool, bind_addr: String) -> IpcResult<HostStatus> {
     let mut config = read_host_config()?
-        .ok_or_else(|| ipc("接收端尚未初始化：请先选择密码或 SSH 授权公钥"))?;
-    if enabled && bind_addr.trim().is_empty() { return Err(ipc("必须明确选择监听地址")); }
+        .ok_or_else(|| ipc(tr!("The host is not initialized yet: choose a password or SSH authorized keys first", "接收端尚未初始化：请先选择密码或 SSH 授权公钥")))?;
+    if enabled && bind_addr.trim().is_empty() { return Err(ipc(tr!("A listen address must be chosen explicitly", "必须明确选择监听地址"))); }
     // 先校验并占用新地址：地址错误或端口已占用时，不停掉旧接收端及其终端。
     let listener = if enabled {
         config.fingerprint().map_err(ipc)?;
         let addr: SocketAddr = bind_addr.parse().map_err(ipc)?;
-        if addr.port() == 0 { return Err(ipc("监听端口不能为 0")); }
+        if addr.port() == 0 { return Err(ipc(tr!("The listen port cannot be 0", "监听端口不能为 0"))); }
         let state: tauri::State<AppState> = app.state();
         if state.host_running.load(Ordering::SeqCst) && config.listen.as_deref() == Some(addr.to_string().as_str()) {
             return host_status(app);
@@ -458,7 +460,7 @@ pub async fn probe_host(host: String, port: u16) -> IpcResult<FingerprintDto> {
     let pins = [confirmed_fingerprint(&host, port), known_hosts_entry(&host, port)];
     for pinned in pins.iter().flatten() {
         if termbridge::client::HostFingerprint::new(pinned.clone()).base64_part() != fp.base64_part() {
-            return Err(ipc(format!("主机指纹变化，已阻断连接。已有记录: {pinned}；当前: {}", fp.sha256)));
+            return Err(ipc(tr!("Host fingerprint changed; connection blocked. Recorded: {pinned}; current: {}", "主机指纹变化，已阻断连接。已有记录: {pinned}；当前: {}", fp.sha256)));
         }
     }
     Ok(FingerprintDto { fingerprint: fp.sha256, trusted: pins.iter().any(Option::is_some) })
@@ -474,14 +476,16 @@ pub async fn confirm_host_fingerprint(
     let actual = termbridge::client::probe_host(&host, port).await.map_err(ipc)?;
     let shown = termbridge::client::HostFingerprint::new(fingerprint);
     if actual.base64_part() != shown.base64_part() {
-        return Err(ipc(format!(
+        return Err(ipc(tr!(
+            "Fingerprint mismatch: shown {}, actual {}; probe again",
             "指纹不一致：展示 {}，实际 {}；请重新探测",
-            shown.sha256, actual.sha256
+            shown.sha256,
+            actual.sha256
         )));
     }
     for pinned in [confirmed_fingerprint(&host, port), known_hosts_entry(&host, port)].into_iter().flatten() {
         if termbridge::client::HostFingerprint::new(pinned).base64_part() != actual.base64_part() {
-            return Err(ipc("主机指纹变化，已阻断连接；不能通过重新确认覆盖旧记录"));
+            return Err(ipc(tr!("Host fingerprint changed; connection blocked; a stored record cannot be replaced by re-confirming", "主机指纹变化，已阻断连接；不能通过重新确认覆盖旧记录")));
         }
     }
     store_confirmed_fingerprint(&host, port, &actual.sha256)?;
@@ -497,7 +501,7 @@ fn find_session(state: &tauri::State<AppState>, session_id: &str) -> IpcResult<A
         .unwrap()
         .get(session_id)
         .cloned()
-        .ok_or_else(|| ipc(format!("会话不存在: {session_id}")))
+        .ok_or_else(|| ipc(tr!("Session not found: {session_id}", "会话不存在: {session_id}")))
 }
 
 async fn pump_request(session: &Session, req: Request) -> IpcResult<Response> {
@@ -506,10 +510,10 @@ async fn pump_request(session: &Session, req: Request) -> IpcResult<Response> {
         .tx
         .send(PumpCmd::Request(req, tx))
         .await
-        .map_err(|_| ipc("会话 pump 已退出"))?;
-    let response = rx.await.map_err(|_| ipc("会话 pump 已退出"))?.map_err(ipc)?;
+        .map_err(|_| ipc(tr!("The session pump has exited", "会话 pump 已退出")))?;
+    let response = rx.await.map_err(|_| ipc(tr!("The session pump has exited", "会话 pump 已退出")))?.map_err(ipc)?;
     match response {
-        Response::Error { code, message } => Err(ipc(format!("{code}: {message}"))),
+        Response::Error { code, message } => Err(ipc(format!("{code}: {}", wire_message(&code, &message)))),
         ok => Ok(ok),
     }
 }
@@ -792,7 +796,7 @@ async fn forward_event(
             }
             FrontEvent::InputRejected(InputRejectedEv {
                 session_id: session_id.to_string(),
-                code: code.clone(), message: message.clone(),
+                code: code.clone(), message: wire_message(code, message),
             })
         }
         Event::Resized { session_id, rows, cols } => FrontEvent::Resized(ResizedEv {
@@ -840,13 +844,15 @@ fn parse_host_fingerprint(profile: &Profile, password_missing_hint: bool) -> Ipc
     let cli = known_hosts_entry(&profile.host, profile.port);
     if let (Some(a), Some(b)) = (&gui, &cli) {
         if termbridge::client::HostFingerprint::new(a.clone()).base64_part() != termbridge::client::HostFingerprint::new(b.clone()).base64_part() {
-            return Err(ipc("GUI 和 CLI 的指纹记录冲突，已阻断连接"));
+            return Err(ipc(tr!("The GUI and CLI fingerprint records conflict; connection blocked", "GUI 和 CLI 的指纹记录冲突，已阻断连接")));
         }
     }
     if let Some(fp) = gui.or(cli) { return Ok(fp); }
-    Err(ipc(format!(
+    Err(ipc(tr!(
+        "First connection to {}:{} requires confirming the host fingerprint in the UI first (probe_host / confirm_host_fingerprint); it is never trusted automatically",
         "首次连接 {}:{} 需要先在界面确认主机指纹（probe_host / confirm_host_fingerprint），不自动信任",
-        profile.host, profile.port
+        profile.host,
+        profile.port
     )))
 }
 
@@ -855,9 +861,9 @@ fn parse_host_fingerprint(profile: &Profile, password_missing_hint: bool) -> Ipc
 pub fn key_passphrase_required(profile_id: String) -> IpcResult<bool> {
     let id = Uuid::parse_str(&profile_id).map_err(ipc)?;
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
-    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc("档案不存在"))?;
-    if !matches!(profile.auth, config::AuthKind::Key) { return Err(ipc("该配置未使用 SSH 私钥")); }
-    let path = profile.key_path.as_ref().ok_or_else(|| ipc("档案未配置私钥路径"))?;
+    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
+    if !matches!(profile.auth, config::AuthKind::Key) { return Err(ipc(tr!("This profile does not use an SSH private key", "该配置未使用 SSH 私钥"))); }
+    let path = profile.key_path.as_ref().ok_or_else(|| ipc(tr!("The profile has no private key path configured", "档案未配置私钥路径")))?;
     config::key_passphrase_required(path).map_err(ipc)
 }
 
@@ -875,13 +881,13 @@ fn auth_method(profile: &Profile, password: Option<String>) -> IpcResult<AuthMet
                                 .and_then(|e| e.get_password().ok())
                         })
                         .flatten();
-                    remembered.ok_or_else(|| ipc("缺少连接密码：请在界面输入密码或先保存（不可隐式成功）"))?
+                    remembered.ok_or_else(|| ipc(tr!("Missing connection password: enter it in the UI or save it first (never succeeds implicitly)", "缺少连接密码：请在界面输入密码或先保存（不可隐式成功）")))?
                 }
             };
             Ok(AuthMethod::Password { password })
         }
         config::AuthKind::Key => {
-            let path = profile.key_path.as_ref().ok_or_else(|| ipc("档案未配置私钥路径"))?;
+            let path = profile.key_path.as_ref().ok_or_else(|| ipc(tr!("The profile has no private key path configured", "档案未配置私钥路径")))?;
             let passphrase = password.filter(|p| !p.is_empty());
             config::validate_private_key(path, passphrase.as_deref()).map_err(ipc)?;
             Ok(AuthMethod::PrivateKey {
@@ -906,7 +912,7 @@ pub async fn create_session(
         .items
         .into_iter()
         .find(|p| p.id == uid)
-        .ok_or_else(|| ipc("档案不存在"))?;
+        .ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
 
     let fp = parse_host_fingerprint(&profile, false)?;
     let auth = auth_method(&profile, password)?;
@@ -927,8 +933,8 @@ pub async fn create_session(
         .map_err(ipc)?;
     let remote = match resp {
         Response::Created { session } => session,
-        Response::Error { code, message } => return Err(ipc(format!("{code}: {message}"))),
-        other => return Err(ipc(format!("意外的服务端响应: {other:?}"))),
+        Response::Error { code, message } => return Err(ipc(format!("{code}: {}", wire_message(&code, &message)))),
+        other => return Err(ipc(tr!("Unexpected server response: {other:?}", "意外的服务端响应: {other:?}"))),
     };
 
     let sid = remote.id.to_string();
@@ -964,7 +970,7 @@ pub async fn create_session(
 pub async fn list_remote_sessions(profile_id: String, password: Option<String>) -> IpcResult<Vec<SessionInfo>> {
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     let id = Uuid::parse_str(&profile_id).map_err(ipc)?;
-    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc("档案不存在"))?;
+    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
     let fp = parse_host_fingerprint(&profile, false)?;
     let auth = auth_method(&profile, password)?;
     let mut client = Client::connect(ClientConfig::new(&profile.host, profile.port, &profile.user,
@@ -972,8 +978,8 @@ pub async fn list_remote_sessions(profile_id: String, password: Option<String>) 
     let result = client.request(Request::List).await.map_err(ipc)?;
     match result {
         Response::Sessions { sessions } => Ok(sessions),
-        Response::Error { code, message } => Err(ipc(format!("{code}: {message}"))),
-        _ => Err(ipc("意外的列表响应")),
+        Response::Error { code, message } => Err(ipc(format!("{code}: {}", wire_message(&code, &message)))),
+        _ => Err(ipc(tr!("Unexpected list response", "意外的列表响应"))),
     }
 }
 
@@ -984,7 +990,7 @@ pub async fn connect_existing_session(
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     let id = Uuid::parse_str(&profile_id).map_err(ipc)?;
     let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
-    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc("档案不存在"))?;
+    let profile = profiles.items.into_iter().find(|p| p.id == id).ok_or_else(|| ipc(tr!("Profile not found", "档案不存在")))?;
     let fp = parse_host_fingerprint(&profile, false)?;
     let auth = auth_method(&profile, password)?;
     let mut client = Client::connect(ClientConfig::new(&profile.host, profile.port, &profile.user,
@@ -1001,8 +1007,8 @@ pub async fn connect_existing_session(
         .map_err(ipc)?;
     let (remote, has_control) = match result {
         Response::Attached { session, has_control, .. } => (session, has_control),
-        Response::Error { code, message } => return Err(ipc(format!("{code}: {message}"))),
-        _ => return Err(ipc("意外的附着响应")),
+        Response::Error { code, message } => return Err(ipc(format!("{code}: {}", wire_message(&code, &message)))),
+        _ => return Err(ipc(tr!("Unexpected attach response", "意外的附着响应"))),
     };
     let sid_text = sid.to_string();
     let meta = SessionMeta {
@@ -1064,8 +1070,8 @@ pub async fn attach_session(
             let info = to_front_info(&remote, &session.info());
             Ok(serde_json::json!({ "session": info, "resumed": resumed, "input_next": input_next }))
         }
-        Response::Error { code, message } => Err(ipc(format!("{code}: {message}"))),
-        other => Err(ipc(format!("意外的服务端响应: {other:?}"))),
+        Response::Error { code, message } => Err(ipc(format!("{code}: {}", wire_message(&code, &message)))),
+        other => Err(ipc(tr!("Unexpected server response: {other:?}", "意外的服务端响应: {other:?}"))),
     }
 }
 
@@ -1119,7 +1125,7 @@ pub async fn send_input(
         return Ok(());
     }
     if data.len() > 64 * MAX_INPUT_CHUNK {
-        return Err(ipc("输入超过单次上限"));
+        return Err(ipc(tr!("Input exceeds the per-call limit", "输入超过单次上限")));
     }
     let sid = Uuid::parse_str(&session_id).map_err(ipc)?;
     let session = {
@@ -1129,11 +1135,11 @@ pub async fn send_input(
     // 串行化并发输入：偏移分配与帧发送必须同序。
     let _gate = session.input_gate.lock().await;
     if data.len() > session.input_buffer.lock().unwrap().available() {
-        return Err(ipc("未确认输入缓冲已满，拒绝本地新输入"));
+        return Err(ipc(tr!("The unacknowledged input buffer is full; new local input rejected", "未确认输入缓冲已满，拒绝本地新输入")));
     }
     for chunk in data.chunks(MAX_INPUT_CHUNK) {
         let offset = session.input_buffer.lock().unwrap().queue(chunk)
-            .ok_or_else(|| ipc("未确认输入缓冲已满，拒绝本地新输入"))?;
+            .ok_or_else(|| ipc(tr!("The unacknowledged input buffer is full; new local input rejected", "未确认输入缓冲已满，拒绝本地新输入")))?;
         session.input_sender.send_input(sid, session.stream_id, offset, chunk)
             .await.map_err(ipc)?;
     }

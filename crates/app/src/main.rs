@@ -1,6 +1,11 @@
-use clap::Parser;
-
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    termbridge::cli::run_cli(termbridge::cli::Cli::parse()).await
+async fn main() -> std::process::ExitCode {
+    let cli = termbridge::cli::parse();
+    match termbridge::cli::run_cli(cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            termbridge::cli::report_error(&err);
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

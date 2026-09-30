@@ -6,7 +6,7 @@ TermBridge is a cross-platform remote terminal tool. Terminal sessions live on t
 
 Every device with TermBridge installed can act as both a host and a client. The transport is SSH: the host embeds an SSH server built on [russh](https://github.com/Eugeny/russh), and it is intended for networks where the host is directly reachable, such as a LAN or Tailscale.
 
-> Current version: 0.2.0, under active development. See [Development status](#development-status).
+> Current version: 0.2.1, under active development. See [Development status](#development-status).
 
 ## Features
 
@@ -14,7 +14,8 @@ Every device with TermBridge installed can act as both a host and a client. The 
 - Keystrokes are sent in real time, so full-screen programs such as vim, htop and less work.
 - A session can be viewed by several clients at once, but only one client can type at a time.
 - SSH public-key authentication and a separate password authentication are supported. The host fingerprint is confirmed on first connection.
-- A desktop GUI and a `termbridge` command-line tool are provided.
+- A desktop GUI and a `termbridge` command-line tool are provided, both in English and Simplified Chinese (see [Language](#language)).
+- Scripts and AI agents can drive sessions without a terminal, through `--json` commands (see [Agent and script interface](#agent-and-script-interface)).
 - Runs on Windows, Linux and macOS.
 
 TermBridge uses its own SSH subsystem protocol (`termbridge-v2`). It is not interoperable with standard SSH clients or servers, and it provides no relay or NAT traversal.
@@ -54,9 +55,7 @@ The examples below use A as the host and B as the client.
 
 ### Enable the host (A)
 
-The desktop GUI is currently available in Chinese only; button and panel names are given below in English with the original Chinese label in parentheses.
-
-GUI: in the local receiver panel (「本应用接收端」), choose an authentication method and initialize (「初始化」), set the listen address and port, then click Enable (「启用」).
+GUI: in the "Local receiver" panel, choose an authentication method and click "Initialize", set the listen address and port, then click "Enable".
 
 Command line:
 
@@ -76,9 +75,9 @@ termbridge host run                                # run in the foreground; stop
 
 ### Connect (B)
 
-GUI: create a profile in the connection profiles panel (「连接配置」) with the host, port, username and authentication method. After saving, click New terminal (「新建终端」) to create a session, or Existing terminals (「已有终端」) to attach to a running one. On first connection the host fingerprint is shown; compare it with the output of `host status` on A before confirming.
+GUI: create a profile in the "Connection profiles" panel with the host, port, username and authentication method. After saving, click "New terminal" to create a session, or "Existing terminals" to attach to a running one. On first connection the host fingerprint is shown; compare it with the output of `host status` on A before confirming.
 
-On a session tab, Take control (「接管输入」) acquires control, Detach (「分离」) disconnects this client and keeps the session alive, and Terminate (「终止」) ends the session.
+On a session tab, "Take control" acquires control, "Detach" disconnects this client and keeps the session alive, and "Terminate" ends the session.
 
 Command line:
 
@@ -108,11 +107,47 @@ Local shortcuts use Ctrl+] as a prefix; pressing any other key after the prefix 
 | Ctrl+] e | End the remote session; press Ctrl+] e again within 3 seconds to confirm |
 | Ctrl+] Ctrl+] | Send a literal Ctrl+] to the remote side |
 
+## Agent and script interface
+
+Everything an agent needs is available as non-interactive commands with machine-readable output. Add `--json` to `profile`, `session` and `host status` commands: a success prints one JSON object with `"ok": true` on stdout, a failure prints `{"ok": false, "error": {"code": ..., "message": ...}}` on stdout and exits with status 1. With `--json` the commands never prompt (they fail with `prompt_required` instead) and messages are always English.
+
+Connecting without a person at the keyboard:
+
+- `--trust-fingerprint SHA256:...` trusts an unknown host whose fingerprint equals the given value and remembers it. Get the value from a trusted channel, for example `termbridge host status` on the host. Without it, the first connection fails with `fingerprint_untrusted` and the observed fingerprint in `error.details.fingerprint`. A fingerprint that changed since it was recorded is always refused (`fingerprint_changed`).
+- `--password-stdin` reads the password (or the key passphrase) from the first line of stdin. With key authentication and an unencrypted key nothing is needed.
+
+Working in a session, either in a new one (the agent's own "tab") or an existing one (for example the one a person has open):
+
+```sh
+termbridge --json session create -p a-box --title agent          # new session; returns session.id
+termbridge --json session list   -p a-box                         # existing sessions
+termbridge --json session send   -p a-box --session-id <UUID> --take-control \
+    --text 'make test' --enter --wait-for '^(PASS|FAIL)' --timeout 600
+termbridge --json session read   -p a-box --session-id <UUID>                 # current screen
+termbridge --json session read   -p a-box --session-id <UUID> --since <offset> # output since an offset
+termbridge --json session end    -p a-box --session-id <UUID> --take-control
+```
+
+- `send` types `--text` literally, presses Enter with `--enter`, then sends each `--key` in order (`enter`, `tab`, `esc`, `backspace`, `space`, `up`/`down`/`left`/`right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `f1`–`f12`, `ctrl-<letter>`, `alt-<char>`). Invalid arguments are rejected before connecting.
+- `send` returns when the input has been acknowledged by the host and a wait condition is met: `--wait-idle MS` (no new output for that long; 500 by default), `--wait-for REGEX` (the output or the screen matches; `^` and `$` match per line) or `--timeout SECONDS` (default 30). `--no-wait` returns right after the acknowledgement. `read` returns immediately unless wait flags are given. Use a pattern the typed command line itself does not contain, because the terminal echoes what you type.
+- The result contains `reason` (`idle`, `match`, `timeout`, `ended` or `immediate`), `output` (plain text produced since the command attached; escape sequences are stripped on a best-effort basis), `screen` (`lines`, `rows`, `cols`, cursor position, `alternate_screen`), and `offset`, the output position to pass as `--since` next time. `read --since` returns only the output, and `since_unavailable` is true if the host no longer keeps that part (the screen is returned instead).
+- Only the controller's input reaches the terminal. If another client (for example a person's window) holds control, `send` fails with `not_controller`; pass `--take-control` to take it over. Control also stays with a client for 60 seconds after it disconnects, so an agent that sends several commands in a row should pass `--take-control` each time. The agent never changes the terminal size.
+- Input is delivered exactly once by offset. If the connection drops or the host does not acknowledge in time, `send` fails with `input_state_unknown` or `input_unconfirmed` and does not resend; read the screen to see what happened.
+- Reading a session gives the agent everything on that terminal, including secrets that were printed there. TermBridge itself does not log terminal input or output.
+
+## Language
+
+The command line and the desktop app are available in English and Simplified Chinese; the default is English unless the system language is Chinese.
+
+- Command line: the language is taken from, in order, `--lang en|zh`, the `TERMBRIDGE_LANG` environment variable, the locale variables `LC_ALL` / `LC_MESSAGES` / `LANG` (on Windows also the user's default locale), and finally English. `--lang` is accepted anywhere on the command line, for example `termbridge --lang zh host status`. It also switches the `--help` text; the fixed headings clap generates itself (such as "Usage" and "Options") stay in English.
+- Desktop app: use the language selector in the top bar. The choice is remembered; without one, the app follows the system language. Error messages from the backend and the tray menu switch with it.
+- The protocol itself is language-neutral: hosts send English diagnostics together with stable error codes, and each client shows its own translation of the code.
+
 ## Session lifecycle
 
 - When a client disconnects, exits or loses its network, the session keeps running. After re-attaching, the client first receives the current screen and then the subsequent output. Automatic reconnection is not supported yet.
 - When the shell in a terminal exits (for example via `exit`), the session is removed immediately and its resources are released; attached clients receive an end notification.
-- When the host stops (Ctrl+C, "Stop local receiver" (「停止本应用接收」) in the GUI, or quitting from the tray), all of its sessions end. On Windows, a Job Object terminates every child process started inside the terminal, including when the host exits abnormally. On Linux and macOS, the shell and every process it started are terminated per session (sid), including background jobs, processes started with `nohup` and processes that ignore SIGHUP. Daemons that deliberately leave the session with `setsid` are not affected, and nothing is cleaned up if the host is killed with SIGKILL.
+- When the host stops (Ctrl+C, "Stop local receiver" in the GUI, or quitting from the tray), all of its sessions end. On Windows, a Job Object terminates every child process started inside the terminal, including when the host exits abnormally. On Linux and macOS, the shell and every process it started are terminated per session (sid), including background jobs, processes started with `nohup` and processes that ignore SIGHUP. Daemons that deliberately leave the session with `setsid` are not affected, and nothing is cleaned up if the host is killed with SIGKILL.
 - Sessions are kept in memory only and are not restored after the host or the system restarts.
 
 ## Security
@@ -160,7 +195,7 @@ Existing sessions are not restored when the service restarts.
 
 ## Desktop app notes
 
-- Closing the window hides the app to the tray; click the tray icon to restore it. To quit, use "Quit TermBridge" (「退出 TermBridge」) in the tray menu, which stops this machine's host and ends its sessions.
+- Closing the window hides the app to the tray; click the tray icon to restore it. To quit, use "Quit TermBridge (stops this GUI's host)" in the tray menu, which stops this machine's host and ends its sessions.
 - The desktop app does not start at login and does not enable the host automatically on launch. For unattended operation, use the command-line tool together with a system service.
 
 ## Building from source

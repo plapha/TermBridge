@@ -723,7 +723,7 @@ impl SessionManager {
         #[cfg(windows)]
         if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
             eprintln!(
-                "警告：无法清除继承的 Ctrl+C 忽略属性：{}",
+                "warning: could not clear the inherited Ctrl+C ignore flag: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -1028,7 +1028,7 @@ impl SessionManager {
             None => {
                 return InputOutcome::Rejected {
                     code: "session_not_found",
-                    message: "会话不存在或已结束".into(),
+                    message: "session does not exist or has ended".into(),
                     next: 0,
                 }
             }
@@ -1043,7 +1043,7 @@ impl SessionManager {
         if !session.live.load(Ordering::SeqCst) {
             return InputOutcome::Rejected {
                 code: "session_not_live",
-                message: "会话已结束".into(),
+                message: "session has ended".into(),
                 next: next_of(&session),
             };
         }
@@ -1051,14 +1051,14 @@ impl SessionManager {
         if n == 0 || n > MAX_INPUT_CHUNK {
             return InputOutcome::Rejected {
                 code: "invalid_input",
-                message: format!("输入长度必须在 1..={MAX_INPUT_CHUNK} 字节之间"),
+                message: format!("input length must be between 1 and {MAX_INPUT_CHUNK} bytes"),
                 next: next_of(&session),
             };
         }
         let Some(end) = offset.checked_add(n as u64) else {
             return InputOutcome::Rejected {
                 code: "invalid_input",
-                message: "输入偏移超出范围".into(),
+                message: "input offset out of range".into(),
                 next: next_of(&session),
             };
         };
@@ -1089,7 +1089,7 @@ impl SessionManager {
         let Some(entry) = streams.get_mut(&stream_id) else {
             return InputOutcome::Rejected {
                 code: "not_controller",
-                message: "该输入流不在会话中".into(),
+                message: "input stream is not part of the session".into(),
                 next: 0,
             };
         };
@@ -1101,7 +1101,7 @@ impl SessionManager {
         if offset > next {
             return InputOutcome::Rejected {
                 code: "input_gap",
-                message: format!("输入缺口：期望偏移 {next}，收到 {offset}"),
+                message: format!("input gap: expected offset {next}, got {offset}"),
                 next,
             };
         }
@@ -1109,7 +1109,7 @@ impl SessionManager {
             entry.next = end;
             return InputOutcome::Rejected {
                 code: "not_controller",
-                message: "观察模式，按键未发送".into(),
+                message: "observer mode: input not sent".into(),
                 next: end,
             };
         }
@@ -1117,7 +1117,7 @@ impl SessionManager {
         if !session.input_queue.try_push(data[skip..].to_vec()) {
             return InputOutcome::Rejected {
                 code: "busy",
-                message: "输入队列已满，请稍后按偏移重发".into(),
+                message: "input queue full; retry later from the acknowledged offset".into(),
                 next,
             };
         }
@@ -2115,7 +2115,8 @@ mod tests {
         let stream = Uuid::new_v4();
         let mut subscription = mgr.attach(info.id, stream, 0, None).unwrap().subscription;
         // 命令行回显里标记后面是 `$!`，只有执行结果里标记后面才是数字。
-        let command = format!("{launch}; echo {marker}_$!\r");
+        // launch 以 `&` 结尾，它本身就是命令分隔符；再加 `;` 会变成 `&;` 语法错误。
+        let command = format!("{launch} echo {marker}_$!\r");
         assert!(matches!(
             mgr.input(info.id, stream, 0, command.as_bytes()),
             InputOutcome::Ack { .. }

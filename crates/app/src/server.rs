@@ -126,7 +126,7 @@ impl Worker {
         let manager = self.shared.manager.clone();
         let outcome = tokio::task::spawn_blocking(move || f(&manager))
             .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("请求处理失败：{e}")));
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("request handler failed: {e}")));
         let body = outcome.unwrap_or_else(|e| Response::Error {
             code: "request_failed".into(),
             message: e.to_string(),
@@ -136,7 +136,7 @@ impl Worker {
 
     async fn request(&mut self, id: Uuid, req: Request) -> Result<(), ()> {
         if self.shared.stopped.load(Ordering::SeqCst) {
-            return self.error(id, "host_stopped", "接收端已停止").await;
+            return self.error(id, "host_stopped", "host stopped").await;
         }
         match req {
             Request::List => {
@@ -161,7 +161,9 @@ impl Worker {
             }
             Request::Detach { session_id } => {
                 let Some(stream_id) = self.stream_for(session_id) else {
-                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                    return self
+                        .error(id, "not_attached", "not attached to this session")
+                        .await;
                 };
                 let (_, token) = self.attached.remove(&session_id).unwrap();
                 if let Some(task) = self.tasks.remove(&session_id) {
@@ -175,7 +177,9 @@ impl Worker {
             }
             Request::TakeControl { session_id } => {
                 let Some(stream_id) = self.stream_for(session_id) else {
-                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                    return self
+                        .error(id, "not_attached", "not attached to this session")
+                        .await;
                 };
                 self.blocking(id, move |m| {
                     m.take_control(session_id, stream_id)
@@ -189,7 +193,9 @@ impl Worker {
                 cols,
             } => {
                 let Some(stream_id) = self.stream_for(session_id) else {
-                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                    return self
+                        .error(id, "not_attached", "not attached to this session")
+                        .await;
                 };
                 self.blocking(id, move |m| {
                     m.resize(session_id, stream_id, rows, cols)
@@ -199,7 +205,9 @@ impl Worker {
             }
             Request::End { session_id } => {
                 let Some(stream_id) = self.stream_for(session_id) else {
-                    return self.error(id, "not_attached", "尚未挂接到该会话").await;
+                    return self
+                        .error(id, "not_attached", "not attached to this session")
+                        .await;
                 };
                 let result = self
                     .blocking(id, move |m| {
@@ -228,7 +236,7 @@ impl Worker {
             manager.attach(session_id, stream_id, input_base, resume_from)
         })
         .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("请求处理失败：{e}")));
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("request handler failed: {e}")));
         let attachment: Attachment = match outcome {
             Ok(attachment) => attachment,
             Err(e) => return self.error(id, "attach_failed", e.to_string()).await,
@@ -494,7 +502,7 @@ impl server::Handler for HostServer {
                             if self.shared.stopped.load(Ordering::SeqCst) {
                                 InputOutcome::Rejected {
                                     code: "host_stopped",
-                                    message: "接收端已停止".into(),
+                                    message: "host stopped".into(),
                                     next: 0,
                                 }
                             } else {
@@ -505,7 +513,7 @@ impl server::Handler for HostServer {
                         }
                         Err(_) => InputOutcome::Rejected {
                             code: "invalid_data",
-                            message: "输入数据不是有效的 base64".into(),
+                            message: "input data is not valid base64".into(),
                             next: 0,
                         },
                     };
@@ -555,8 +563,14 @@ impl server::Handler for HostServer {
 pub async fn run(config: HostConfig, listen: SocketAddr) -> Result<()> {
     let socket = TcpListener::bind(listen)
         .await
-        .with_context(|| format!("无法监听 {listen}"))?;
-    println!("接收端监听 {listen}（Ctrl+C 停止并结束会话）");
+        .with_context(|| crate::tr!("Cannot listen on {listen}", "无法监听 {listen}"))?;
+    println!(
+        "{}",
+        crate::tr!(
+            "Host listening on {listen} (Ctrl+C stops it and ends all sessions)",
+            "接收端监听 {listen}（Ctrl+C 停止并结束会话）"
+        )
+    );
     run_on_listener(config, socket, async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -568,8 +582,8 @@ pub async fn run_on_listener<F>(config: HostConfig, socket: TcpListener, stop: F
 where
     F: std::future::Future<Output = ()> + Send,
 {
-    let key =
-        russh::keys::load_secret_key(host_key_path(), None).context("加载接收端主机密钥失败")?;
+    let key = russh::keys::load_secret_key(host_key_path(), None)
+        .with_context(|| crate::tr!("Failed to load the host key", "加载接收端主机密钥失败"))?;
     let ssh = Arc::new(server::Config {
         keys: vec![key],
         auth_rejection_time: Duration::from_secs(2),

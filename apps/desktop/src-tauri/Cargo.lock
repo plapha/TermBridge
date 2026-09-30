@@ -4708,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -4718,6 +4718,7 @@ dependencies = [
  "keyring",
  "rand",
  "rand_core 0.6.4",
+ "regex",
  "rpassword",
  "russh",
  "serde",
@@ -4726,12 +4727,13 @@ dependencies = [
  "termbridge-protocol",
  "tokio",
  "uuid",
+ "vt100",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "termbridge-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "keyring",
@@ -4749,10 +4751,11 @@ dependencies = [
 
 [[package]]
 name = "termbridge-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "libc",
  "portable-pty",
  "termbridge-protocol",
  "tokio",
@@ -4763,7 +4766,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
