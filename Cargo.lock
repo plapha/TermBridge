@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",

@@ -6,7 +6,7 @@ TermBridge is a cross-platform remote terminal tool. Terminal sessions live on t
 
 Every device with TermBridge installed can act as both a host and a client. The transport is SSH: the host embeds an SSH server built on [russh](https://github.com/Eugeny/russh), and it is intended for networks where the host is directly reachable, such as a LAN or Tailscale.
 
-> Current version: 0.2.0, under active development. See [Development status](#development-status).
+> Current version: 0.2.1, under active development. See [Development status](#development-status).
 
 ## Features
 
