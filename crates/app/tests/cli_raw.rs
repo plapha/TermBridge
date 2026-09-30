@@ -223,7 +223,7 @@ async fn cli_raw_attach_round_trip() {
             &mut c1,
             s1.id,
             &mut outer_tracker,
-            "Left raw mode",
+            "left raw mode",
             Duration::from_secs(15)
         )
         .await,
