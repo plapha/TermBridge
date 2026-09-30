@@ -2115,7 +2115,8 @@ mod tests {
         let stream = Uuid::new_v4();
         let mut subscription = mgr.attach(info.id, stream, 0, None).unwrap().subscription;
         // 命令行回显里标记后面是 `$!`，只有执行结果里标记后面才是数字。
-        let command = format!("{launch}; echo {marker}_$!\r");
+        // launch 以 `&` 结尾，它本身就是命令分隔符；再加 `;` 会变成 `&;` 语法错误。
+        let command = format!("{launch} echo {marker}_$!\r");
         assert!(matches!(
             mgr.input(info.id, stream, 0, command.as_bytes()),
             InputOutcome::Ack { .. }
