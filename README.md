@@ -14,7 +14,7 @@ Every device with TermBridge installed can act as both a host and a client. The 
 - Keystrokes are sent in real time, so full-screen programs such as vim, htop and less work.
 - A session can be viewed by several clients at once, but only one client can type at a time.
 - SSH public-key authentication and a separate password authentication are supported. The host fingerprint is confirmed on first connection.
-- A desktop GUI and a `termbridge` command-line tool are provided.
+- A desktop GUI and a `termbridge` command-line tool are provided, both in English and Simplified Chinese (see [Language](#language)).
 - Runs on Windows, Linux and macOS.
 
 TermBridge uses its own SSH subsystem protocol (`termbridge-v2`). It is not interoperable with standard SSH clients or servers, and it provides no relay or NAT traversal.
@@ -54,9 +54,7 @@ The examples below use A as the host and B as the client.
 
 ### Enable the host (A)
 
-The desktop GUI is currently available in Chinese only; button and panel names are given below in English with the original Chinese label in parentheses.
-
-GUI: in the local receiver panel (「本应用接收端」), choose an authentication method and initialize (「初始化」), set the listen address and port, then click Enable (「启用」).
+GUI: in the "Local receiver" panel, choose an authentication method and click "Initialize", set the listen address and port, then click "Enable".
 
 Command line:
 
@@ -76,9 +74,9 @@ termbridge host run                                # run in the foreground; stop
 
 ### Connect (B)
 
-GUI: create a profile in the connection profiles panel (「连接配置」) with the host, port, username and authentication method. After saving, click New terminal (「新建终端」) to create a session, or Existing terminals (「已有终端」) to attach to a running one. On first connection the host fingerprint is shown; compare it with the output of `host status` on A before confirming.
+GUI: create a profile in the "Connection profiles" panel with the host, port, username and authentication method. After saving, click "New terminal" to create a session, or "Existing terminals" to attach to a running one. On first connection the host fingerprint is shown; compare it with the output of `host status` on A before confirming.
 
-On a session tab, Take control (「接管输入」) acquires control, Detach (「分离」) disconnects this client and keeps the session alive, and Terminate (「终止」) ends the session.
+On a session tab, "Take control" acquires control, "Detach" disconnects this client and keeps the session alive, and "Terminate" ends the session.
 
 Command line:
 
@@ -108,11 +106,19 @@ Local shortcuts use Ctrl+] as a prefix; pressing any other key after the prefix 
 | Ctrl+] e | End the remote session; press Ctrl+] e again within 3 seconds to confirm |
 | Ctrl+] Ctrl+] | Send a literal Ctrl+] to the remote side |
 
+## Language
+
+The command line and the desktop app are available in English and Simplified Chinese; the default is English unless the system language is Chinese.
+
+- Command line: the language is taken from, in order, `--lang en|zh`, the `TERMBRIDGE_LANG` environment variable, the locale variables `LC_ALL` / `LC_MESSAGES` / `LANG` (on Windows also the user's default locale), and finally English. `--lang` is accepted anywhere on the command line, for example `termbridge --lang zh host status`. It also switches the `--help` text; the fixed headings clap generates itself (such as "Usage" and "Options") stay in English.
+- Desktop app: use the language selector in the top bar. The choice is remembered; without one, the app follows the system language. Error messages from the backend and the tray menu switch with it.
+- The protocol itself is language-neutral: hosts send English diagnostics together with stable error codes, and each client shows its own translation of the code.
+
 ## Session lifecycle
 
 - When a client disconnects, exits or loses its network, the session keeps running. After re-attaching, the client first receives the current screen and then the subsequent output. Automatic reconnection is not supported yet.
 - When the shell in a terminal exits (for example via `exit`), the session is removed immediately and its resources are released; attached clients receive an end notification.
-- When the host stops (Ctrl+C, "Stop local receiver" (「停止本应用接收」) in the GUI, or quitting from the tray), all of its sessions end. On Windows, a Job Object terminates every child process started inside the terminal, including when the host exits abnormally. On Linux and macOS, the shell and every process it started are terminated per session (sid), including background jobs, processes started with `nohup` and processes that ignore SIGHUP. Daemons that deliberately leave the session with `setsid` are not affected, and nothing is cleaned up if the host is killed with SIGKILL.
+- When the host stops (Ctrl+C, "Stop local receiver" in the GUI, or quitting from the tray), all of its sessions end. On Windows, a Job Object terminates every child process started inside the terminal, including when the host exits abnormally. On Linux and macOS, the shell and every process it started are terminated per session (sid), including background jobs, processes started with `nohup` and processes that ignore SIGHUP. Daemons that deliberately leave the session with `setsid` are not affected, and nothing is cleaned up if the host is killed with SIGKILL.
 - Sessions are kept in memory only and are not restored after the host or the system restarts.
 
 ## Security
@@ -160,7 +166,7 @@ Existing sessions are not restored when the service restarts.
 
 ## Desktop app notes
 
-- Closing the window hides the app to the tray; click the tray icon to restore it. To quit, use "Quit TermBridge" (「退出 TermBridge」) in the tray menu, which stops this machine's host and ends its sessions.
+- Closing the window hides the app to the tray; click the tray icon to restore it. To quit, use "Quit TermBridge (stops this GUI's host)" in the tray menu, which stops this machine's host and ends its sessions.
 - The desktop app does not start at login and does not enable the host automatically on launch. For unattended operation, use the command-line tool together with a system service.
 
 ## Building from source

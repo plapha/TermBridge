@@ -142,6 +142,22 @@ body {
   color: var(--text-dim);
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#lang-select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 4px 6px;
+  font: inherit;
+}
+
 #btn-hide-to-tray {
   flex-shrink: 0;
 }
@@ -311,8 +327,13 @@ body {
 
 .profile-item .profile-actions {
   display: flex;
+  flex-wrap: wrap; /* 英文按钮文字较长，窄面板里换行而不是溢出 */
   gap: 6px;
   margin-top: 6px;
+}
+
+.profile-item .profile-actions button {
+  white-space: nowrap;
 }
 
 .profile-form {

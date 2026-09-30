@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "TermBridge 桌面终端",
+        "title": "TermBridge",
         "width": 1280,
         "height": 800,
         "minWidth": 720,

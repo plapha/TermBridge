@@ -105,6 +105,9 @@ export const commands = {
   storeProfilePassword: (profileId: string, password: string) =>
     invoke<void>("store_profile_password", { profile_id: profileId, password }),
 
+  /** 把界面语言同步给后端：后端错误消息与托盘菜单随之切换。 */
+  setLanguage: (lang: string) => invoke<void>("set_language", { lang }),
+
   hostStatus: () => invoke<HostStatus>("host_status"),
   /** 初始化主机接收端密钥与接收密码（≥12 字符）。 */
   initHost: (password?: string, authorizedKeysPath?: string) =>

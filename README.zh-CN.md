@@ -14,7 +14,7 @@ TermBridge 是一个跨平台的远程终端工具。终端会话运行在接收
 - 按键实时发送，支持 vim、htop、less 等全屏程序
 - 同一会话可以被多个客户端同时查看，同一时间只有一个客户端可以输入
 - 支持 SSH 公钥认证和独立密码认证，首次连接时确认主机指纹
-- 提供桌面图形界面和 `termbridge` 命令行工具
+- 提供桌面图形界面和 `termbridge` 命令行工具，均支持英文和简体中文（见[界面语言](#界面语言)）
 - 支持 Windows、Linux、macOS
 
 TermBridge 使用自定义的 SSH 子系统协议（`termbridge-v2`），不能与标准 SSH 客户端或服务端互通，也不提供中继和 NAT 穿透。
@@ -105,6 +105,14 @@ termbridge session end    -p a-box --session-id <UUID>
 | Ctrl+] t | 接管控制权 |
 | Ctrl+] e | 结束远端会话，需在 3 秒内再按一次 Ctrl+] e 确认 |
 | Ctrl+] Ctrl+] | 向远端发送 Ctrl+] |
+
+## 界面语言
+
+命令行和桌面端支持英文和简体中文；系统语言为中文时默认使用中文，其余情况默认英文。
+
+- 命令行：语言按以下顺序确定：`--lang en|zh`、环境变量 `TERMBRIDGE_LANG`、`LC_ALL` / `LC_MESSAGES` / `LANG`（Windows 上还会参考用户默认区域设置），最后回退到英文。`--lang` 可以写在命令行的任意位置，例如 `termbridge --lang zh host status`，同时决定 `--help` 的语言；clap 自带的固定标题（如 “Usage”“Options”）仍为英文。
+- 桌面端：在顶栏的语言选择器中切换，选择会被记住；没有选择时跟随系统语言。后端返回的错误信息和托盘菜单会随之切换。
+- 协议本身与语言无关：接收端发送英文诊断文本和稳定的错误码，由各客户端按错误码显示自己的译文。
 
 ## 会话生命周期
 

@@ -1,6 +1,7 @@
 import "./styles.css";
 import { commands, invoke, listen, backendAvailable, errorText } from "./ipc";
 import { TerminalView, measureTerminalSize } from "./terminal";
+import { applyStatic, getLang, onLangChange, parseLang, setLang, t } from "./i18n";
 import type {
   AttachResult,
   InputRejectedEvent,
@@ -41,7 +42,7 @@ function enqueueInput(sessionId: string, bytes: Uint8Array): void {
     inputQueues.set(sessionId, queue);
   }
   if (queue.pending.length + bytes.length > MAX_PENDING_INPUT) {
-    showHint("本地输入队列已满，当前按键未发送。\x07");
+    showHint(t("hint.queueFull") + "\x07");
     return;
   }
   for (const byte of bytes) queue.pending.push(byte);
@@ -59,7 +60,7 @@ async function drainInput(sessionId: string, queue: InputQueue): Promise<void> {
     }
   } catch (err) {
     queue.pending.length = 0;
-    handleError(err, "输入发送失败（状态未知，不自动重发）");
+    handleError(err, t("error.inputSend"));
   } finally {
     queue.sending = false;
     if (!queue.closed && queue.pending.length) {
@@ -98,12 +99,15 @@ function handleError(err: unknown, prefix: string): void {
     showDisconnectedPlaceholder();
     return;
   }
-  showError(`${prefix}：${errorText(err)}`);
+  showError(t("error.withPrefix", { prefix, detail: errorText(err) }));
 }
 
 /* ---------- 后端连通性 ---------- */
+let backendConnected = false;
+
 function setBackendStatus(connected: boolean): void {
-  $("backend-status-text").textContent = connected ? "本地核心已连接" : "后端未连接";
+  backendConnected = connected;
+  $("backend-status-text").textContent = connected ? t("backend.connected") : t("backend.disconnected");
   const dot = $("backend-status").querySelector(".dot");
   dot?.classList.toggle("dot-on", connected);
   dot?.classList.toggle("dot-off", !connected);
@@ -116,12 +120,16 @@ function showDisconnectedPlaceholder(): void {
   const overlay = document.createElement("div");
   overlay.className = "backend-disconnected";
   overlay.setAttribute("role", "alert");
-  overlay.innerHTML = `
-    <h2>后端未连接</h2>
-    <p>TermBridge 的本地后端（crates/app）尚未运行或不可达。</p>
-    <p class="hint">界面处于只读占位状态，所有操作已禁用；不会显示任何伪造的连接结果。</p>`;
+  fillDisconnectedOverlay(overlay);
   document.getElementById("app")?.appendChild(overlay);
   setActionsEnabled(false);
+}
+
+function fillDisconnectedOverlay(overlay: HTMLElement): void {
+  overlay.innerHTML = `
+    <h2>${t("backend.disconnected")}</h2>
+    <p>${t("backend.unreachable")}</p>
+    <p class="hint">${t("backend.readonlyHint")}</p>`;
 }
 
 function showBackendRestored(): void {
@@ -208,7 +216,7 @@ async function subscribeEvents(): Promise<void> {
       await listen("session_input_rejected", (raw) => {
         const ev = raw as { payload?: InputRejectedEvent };
         if (!ev?.payload) return;
-        showError(`输入被拒绝（${ev.payload.code}）：${ev.payload.message}`);
+        showError(t("error.inputRejected", { code: ev.payload.code, message: ev.payload.message }));
       }),
     );
   } catch {
@@ -237,9 +245,9 @@ function ensureTerminal(sessionId: string): TerminalView {
     $("terminal-stack").appendChild(container);
     view = new TerminalView(sessionId, container, {
       onInput: (bytes) => enqueueInput(sessionId, bytes),
-      onBlockedInput: () => showHint("观察模式：点「接管输入」后可输入。"),
+      onBlockedInput: () => showHint(t("hint.observer")),
       onResize: () => void syncResize(sessionId),
-      onClipboardError: () => showHint("无法访问系统剪贴板。"),
+      onClipboardError: () => showHint(t("hint.clipboard")),
     });
     terminals.set(sessionId, view);
   }
@@ -276,7 +284,7 @@ async function syncResize(sessionId: string): Promise<void> {
   try {
     await commands.resizeSession(sessionId, rows, cols);
   } catch (err) {
-    handleError(err, "调整终端尺寸失败");
+    handleError(err, t("error.resize"));
   }
 }
 
@@ -338,7 +346,7 @@ async function resyncSession(sessionId: string): Promise<void> {
     updateTerminalChrome();
   } catch (err) {
     snapshotPending.delete(sessionId);
-    handleError(err, "画面重新同步失败");
+    handleError(err, t("error.resync"));
   } finally {
     reattaching.delete(sessionId);
   }
@@ -351,7 +359,7 @@ async function refreshProfiles(): Promise<void> {
     showBackendRestored();
     renderProfiles();
   } catch (err) {
-    handleError(err, "读取连接配置失败");
+    handleError(err, t("error.loadProfiles"));
   }
 }
 
@@ -361,7 +369,7 @@ function renderProfiles(): void {
   if (state.profiles.length === 0) {
     const li = document.createElement("li");
     li.className = "hint";
-    li.textContent = "暂无保存的连接配置。";
+    li.textContent = t("profiles.empty");
     list.appendChild(li);
     return;
   }
@@ -372,10 +380,10 @@ function renderProfiles(): void {
       <div class="profile-title"></div>
       <div class="profile-meta mono"></div>
       <div class="profile-actions">
-        <button type="button" data-act="connect">新建终端</button>
-        <button type="button" data-act="existing">已有终端</button>
-        <button type="button" data-act="edit">编辑</button>
-        <button type="button" data-act="remove">删除</button>
+        <button type="button" data-act="connect">${t("profile.newTerminal")}</button>
+        <button type="button" data-act="existing">${t("profile.existing")}</button>
+        <button type="button" data-act="edit">${t("profile.edit")}</button>
+        <button type="button" data-act="remove">${t("profile.remove")}</button>
       </div>`;
     li.querySelector(".profile-title")!.textContent = p.name;
     li.querySelector(".profile-meta")!.textContent = `${p.user}@${p.host}:${p.port}`;
@@ -393,7 +401,7 @@ function renderProfiles(): void {
 function openProfileForm(p?: Profile): void {
   state.editingProfileId = p?.id ?? null;
   $("profile-form").classList.remove("hidden");
-  $("profile-form-title").textContent = p ? "编辑连接配置" : "新建连接配置";
+  $("profile-form-title").textContent = p ? t("profiles.formEdit") : t("profiles.formNew");
   ($("pf-name") as HTMLInputElement).value = p?.name ?? "";
   ($("pf-host") as HTMLInputElement).value = p?.host ?? "";
   ($("pf-port") as HTMLInputElement).value = String(p?.port ?? 22333);
@@ -425,7 +433,7 @@ async function saveProfileForm(): Promise<void> {
     closeProfileForm();
     await refreshProfiles();
   } catch (err) {
-    handleError(err, "保存连接配置失败");
+    handleError(err, t("error.saveProfile"));
   }
 }
 
@@ -434,7 +442,7 @@ async function removeProfile(p: Profile): Promise<void> {
     await commands.removeProfile(p.id);
     await refreshProfiles();
   } catch (err) {
-    handleError(err, "删除连接配置失败");
+    handleError(err, t("error.removeProfile"));
   }
 }
 
@@ -463,9 +471,9 @@ function passwordModal(host: string, port: number, kind: "password" | "key" = "p
   return new Promise((resolve) => {
     const modal = $("pw-modal");
     $("pw-modal-host").textContent = `${host}:${port}`;
-    $("pw-modal-title").textContent = kind === "key" ? "SSH 私钥口令" : "连接密码";
-    $("pw-modal-label").textContent = kind === "key" ? "私钥口令" : "密码";
-    $("pw-modal-hint").textContent = kind === "key" ? "口令只用于本次解密 SSH 私钥，不会保存或记录。" : "不勾选时密码仅用于本次连接，不会被保存或记录。";
+    $("pw-modal-title").textContent = kind === "key" ? t("pw.titleKey") : t("pw.titlePassword");
+    $("pw-modal-label").textContent = kind === "key" ? t("pw.labelKey") : t("pw.labelPassword");
+    $("pw-modal-hint").textContent = kind === "key" ? t("pw.hintKey") : t("pw.hintPassword");
     $("pw-remember-row").classList.toggle("hidden", kind === "key");
     const input = $("pw-input") as HTMLInputElement;
     const remember = $("pw-remember") as HTMLInputElement;
@@ -481,7 +489,7 @@ function passwordModal(host: string, port: number, kind: "password" | "key" = "p
     const onOk = () => {
       const password = input.value;
       if (!password) {
-        showError(kind === "key" ? "请输入 SSH 私钥口令" : "缺少连接密码：请输入密码后再连接");
+        showError(kind === "key" ? t("pw.needKey") : t("pw.needPassword"));
         return;
       }
       done({ password, remember: kind === "password" && remember.checked });
@@ -506,7 +514,7 @@ function chooseExistingSession(sessions: RemoteSession[]): Promise<string | null
       item.textContent = `${s.title} · ${s.id}`;
       select.append(item);
     }
-    if (!select.options.length) { showError("没有仍在运行的会话；设备重启后旧终端不会自动重建"); resolve(null); return; }
+    if (!select.options.length) { showError(t("existing.none")); resolve(null); return; }
     const done = (value: string | null) => {
       modal.classList.add("hidden");
       $("existing-ok").removeEventListener("click", onOk);
@@ -526,7 +534,7 @@ async function rememberPasswordIfAvailable(profileId: string, password: string):
     await commands.storeProfilePassword(profileId, password);
     await refreshProfiles();
   } catch (err) {
-    showError(`本次连接继续，但系统凭据库无法保存密码：${errorText(err)}`);
+    showError(t("pw.rememberFailed", { detail: errorText(err) }));
   }
 }
 async function connectProfile(p: Profile, existing = false): Promise<void> {
@@ -540,7 +548,7 @@ async function connectProfile(p: Profile, existing = false): Promise<void> {
     let password: string | undefined;
     let rememberNewPassword = false;
     if (p.auth === "password") {
-      const useSaved = p.remember_password && window.confirm("使用系统凭据库中已记住的密码？取消则重新输入。");
+      const useSaved = p.remember_password && window.confirm(t("pw.confirmUseSaved"));
       if (!useSaved) {
         const entered = await passwordModal(p.host, p.port);
         if (!entered) return;
@@ -577,7 +585,7 @@ async function connectProfile(p: Profile, existing = false): Promise<void> {
       await attachSession(session.session_id);
     }
   } catch (err) {
-    handleError(err, "连接失败");
+    handleError(err, t("error.connect"));
   }
 }
 
@@ -609,7 +617,7 @@ async function attachSession(sessionId: string): Promise<void> {
     registerAttachedSession(sessionId, res);
   } catch (err) {
     snapshotPending.delete(sessionId);
-    handleError(err, "附加会话失败");
+    handleError(err, t("error.attach"));
   }
 }
 
@@ -657,26 +665,26 @@ function renderTabs(): void {
     st.textContent = stateLabel(s.state);
     const role = document.createElement("span");
     role.className = "role";
-    role.textContent = s.is_controller ? "控制器" : "只读";
+    role.textContent = s.is_controller ? t("tab.controller") : t("tab.readonly");
     const detach = document.createElement("button");
     detach.type = "button";
-    detach.textContent = "分离";
-    detach.title = "分离：保留会话，仅停止查看";
+    detach.textContent = t("tab.detach");
+    detach.title = t("tab.detachTitle");
     detach.addEventListener("click", (e) => {
       e.stopPropagation();
       void detachCurrent(s.session_id);
     });
     const kill = document.createElement("button");
     kill.type = "button";
-    kill.textContent = "终止";
-    kill.title = "终止：结束该会话";
+    kill.textContent = t("tab.terminate");
+    kill.title = t("tab.terminateTitle");
     kill.addEventListener("click", (e) => {
       e.stopPropagation();
       void endSession(s.session_id);
     });
     const take = document.createElement("button");
     take.type = "button";
-    take.textContent = "接管输入";
+    take.textContent = t("tab.takeControl");
     take.disabled = s.is_controller || !s.online || s.state !== "attached";
     take.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -687,7 +695,7 @@ function renderTabs(): void {
         view?.fit();
         void syncResize(s.session_id);
         renderTabs(); updateTerminalChrome();
-      }).catch((err) => handleError(err, "接管输入失败"));
+      }).catch((err) => handleError(err, t("error.takeControl")));
     });
     tab.append(label, st, role, take, detach, kill);
     tab.addEventListener("click", () => {
@@ -704,15 +712,15 @@ function renderTabs(): void {
 function stateLabel(s: SessionInfo["state"]): string {
   switch (s) {
     case "connecting":
-      return "连接中";
+      return t("state.connecting");
     case "attached":
-      return "已附加";
+      return t("state.attached");
     case "detached":
-      return "已分离";
+      return t("state.detached");
     case "closed":
-      return "已结束";
+      return t("state.closed");
     case "error":
-      return "错误";
+      return t("state.error");
   }
 }
 
@@ -728,12 +736,12 @@ async function detachCurrent(sessionId: string): Promise<void> {
     syncControllerState(sessionId);
     renderTabs();
   } catch (err) {
-    handleError(err, "分离会话失败");
+    handleError(err, t("error.detach"));
   }
 }
 
 async function endSession(sessionId: string): Promise<void> {
-  if (!window.confirm("确定结束远端终端进程？分离可保留会话，结束后无法恢复。")) return;
+  if (!window.confirm(t("confirm.end"))) return;
   try {
     const s = await commands.endSession(sessionId);
     state.sessions = state.sessions.map((x) => (x.session_id === s.session_id ? s : x));
@@ -747,7 +755,7 @@ async function endSession(sessionId: string): Promise<void> {
     }
     renderTabs();
   } catch (err) {
-    handleError(err, "结束会话失败");
+    handleError(err, t("error.end"));
   }
 }
 
@@ -759,7 +767,7 @@ function currentSession(): SessionInfo | null {
 function updateTerminalChrome(): void {
   const s = currentSession();
   for (const id of terminals.keys()) syncControllerState(id);
-  if (s && !s.online) showHint("连接已断开；不会自动重发命令。");
+  if (s && !s.online) showHint(t("hint.offline"));
 }
 
 /* ---------- 主机面板 ---------- */
@@ -778,13 +786,15 @@ async function refreshHost(): Promise<void> {
     const st = await commands.hostStatus();
     showBackendRestored();
     const badge = $("host-state-badge");
-    badge.textContent = st.enabled ? "运行中" : "已停止";
+    badge.textContent = st.enabled ? t("host.running") : t("host.stopped");
     badge.className = `badge ${st.enabled ? "badge-running" : "badge-stopped"}`;
-    $("host-status-text").textContent = st.enabled ? "运行中" : "已停止";
+    $("host-status-text").textContent = st.enabled ? t("host.running") : t("host.stopped");
     $("host-fingerprint").textContent = st.fingerprint ?? "—";
     $("host-auth-status").textContent = !st.fingerprint ? "—" : st.password_enabled
-      ? `产品密码${st.authorized_key_count ? ` + ${st.authorized_key_count} 把公钥` : ""}`
-      : `仅 SSH 密钥（${st.authorized_key_count} 把）`;
+      ? (st.authorized_key_count
+          ? t("host.authStatusPasswordKeys", { count: st.authorized_key_count })
+          : t("host.authStatusPassword"))
+      : t("host.authStatusKeys", { count: st.authorized_key_count });
     $("host-controller").textContent = st.controller ?? "—";
     $("host-migrate-section").classList.toggle("hidden", !st.fingerprint || !st.password_enabled);
     ($("host-migrate-keys") as HTMLButtonElement).disabled = st.enabled;
@@ -808,7 +818,7 @@ async function refreshHost(): Promise<void> {
     ($("host-stop") as HTMLButtonElement).disabled = !st.enabled;
     ($("host-enable") as HTMLButtonElement).disabled = !st.fingerprint;
   } catch (err) {
-    handleError(err, "读取接收状态失败");
+    handleError(err, t("error.hostStatus"));
   }
 }
 
@@ -816,7 +826,7 @@ async function initHost(): Promise<void> {
   const useKeys = (document.querySelector('input[name="host-auth"]:checked') as HTMLInputElement).value === "key";
   const password = ($("host-init-password") as HTMLInputElement).value;
   if (!useKeys && password.length < 12) {
-    showError("接收密码至少需要 12 个字符");
+    showError(t("host.passwordShort"));
     return;
   }
   try {
@@ -829,32 +839,51 @@ async function initHost(): Promise<void> {
     ($("host-enable") as HTMLButtonElement).disabled = false;
     showBackendRestored();
   } catch (err) {
-    handleError(err, "初始化接收端失败");
+    handleError(err, t("error.initHost"));
   }
 }
 
 async function switchHostToKeys(): Promise<void> {
-  if (!window.confirm("确定停用产品专用密码，改为只接受所选文件中的 SSH 授权公钥？请先确保你持有对应私钥。")) return;
+  if (!window.confirm(t("host.confirmMigrate"))) return;
   try {
     await commands.switchHostToKeys(($("host-migrate-key-path") as HTMLInputElement).value.trim());
     await refreshHost();
   } catch (err) {
-    handleError(err, "切换密钥认证失败");
+    handleError(err, t("error.switchKeys"));
   }
 }
 
 async function setHostEnabled(enabled: boolean): Promise<void> {
   const bind = composeBindAddr();
   if (enabled && !bind.includes(":")) {
-    showError("启用接收端必须提供完整监听地址（IP:端口，如 127.0.0.1:22333）");
+    showError(t("host.needAddress"));
     return;
   }
   try {
     await commands.setHostEnabled(enabled, bind);
     await refreshHost();
   } catch (err) {
-    handleError(err, enabled ? "启用接收端失败" : "停止接收端失败");
+    handleError(err, enabled ? t("error.enableHost") : t("error.stopHost"));
   }
+}
+
+/* ---------- 界面语言 ---------- */
+function pushLanguage(): Promise<void> {
+  // 后端不可达时忽略：恢复连接后的下一次切换或启动会再同步。
+  return commands.setLanguage(getLang()).catch(() => {});
+}
+
+/** 语言切换后重绘所有动态生成的文案（静态文案由 applyStatic 处理）。 */
+function renderLanguage(): void {
+  setBackendStatus(backendConnected);
+  const overlay = document.querySelector<HTMLElement>(".backend-disconnected");
+  if (overlay) fillDisconnectedOverlay(overlay);
+  renderProfiles();
+  renderTabs();
+  if (!$("profile-form").classList.contains("hidden")) {
+    $("profile-form-title").textContent = state.editingProfileId ? t("profiles.formEdit") : t("profiles.formNew");
+  }
+  void refreshHost();
 }
 
 /* ---------- 启动 ---------- */
@@ -874,9 +903,19 @@ async function pollBackend(): Promise<void> {
 }
 
 function wireUi(): void {
+  const langSelect = $("lang-select") as HTMLSelectElement;
+  langSelect.value = getLang();
+  langSelect.addEventListener("change", () => {
+    const lang = parseLang(langSelect.value);
+    if (lang) setLang(lang);
+  });
+  onLangChange(() => {
+    renderLanguage();
+    void pushLanguage();
+  });
   $("btn-new-profile").addEventListener("click", () => openProfileForm());
   $("btn-hide-to-tray").addEventListener("click", () => {
-    void invoke("hide_to_tray").catch((err) => handleError(err, "隐藏到托盘失败"));
+    void invoke("hide_to_tray").catch((err) => handleError(err, t("error.hideToTray")));
   });
   $("pf-cancel").addEventListener("click", closeProfileForm);
   $("profile-form").addEventListener("submit", (e) => {
@@ -907,7 +946,13 @@ function wireUi(): void {
 }
 
 async function boot(): Promise<void> {
+  applyStatic();
+  // 动态文案的初始值：后端状态、主机状态在首次刷新前也要用当前语言。
+  setBackendStatus(false);
+  $("host-state-badge").textContent = t("host.stopped");
+  $("host-status-text").textContent = t("host.unknown");
   wireUi();
+  void pushLanguage();
   await subscribeEvents();
   await Promise.all([refreshProfiles(), refreshHost()]);
   if (!backendAvailable) showDisconnectedPlaceholder();
