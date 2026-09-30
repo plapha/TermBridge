@@ -10,11 +10,15 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use termbridge_protocol::{Request, Response};
+use serde_json::json;
+use termbridge_protocol::{Request, Response, SessionInfo};
 
+use crate::agent::{self, coded, coded_with, CodedError};
 use crate::client::{probe_host, AuthMethod, Client, ClientConfig, HostFingerprint};
 use crate::config::{
     self, add_public_key, init_host, known_hosts_path, profiles_path, read_json, save_json,
@@ -95,6 +99,9 @@ fn zh_help(key: &str) -> Option<&'static str> {
     Some(match key {
         "" => "TermBridge：基于 SSH 的远程终端（接收端、连接配置与会话）",
         "/lang" => "界面语言（en 或 zh）；默认取 TERMBRIDGE_LANG 或系统语言",
+        "/json" => "机器可读的 JSON 输出；不会提示输入（缺少时直接报错），消息固定为英文",
+        "/trust_fingerprint" => "信任指纹等于该值的未知主机（不会覆盖已变化的指纹）",
+        "/password_stdin" => "从标准输入的第一行读取密码或私钥口令",
         "host" => "接收端（本机作为被连接方）",
         "host init" => "初始化接收端（产品密码或现有 SSH 授权公钥）",
         "host init/authorized_keys" => {
@@ -126,13 +133,32 @@ fn zh_help(key: &str) -> Option<&'static str> {
         "profile remove" => "删除档案（同时清除 keyring 中的密码）",
         "session" => "远端会话操作",
         "session list" => "列出远端会话",
-        "session list/profile" | "session create/profile" | "session attach/profile"
-        | "session end/profile" => "档案名称",
+        "session list/profile"
+        | "session create/profile"
+        | "session attach/profile"
+        | "session end/profile"
+        | "session send/profile"
+        | "session read/profile" => "档案名称",
         "session create" => "创建会话",
         "session attach" => "附加到会话（raw 模式；Ctrl+] 为本地转义键）",
         "session attach/session_id" => "会话 UUID；省略则列出并选择第一个活跃会话",
         "session end" => "结束会话",
         "session end/take_control" => "其他客户端持有控制权时，必须显式声明接管才能结束",
+        "session send" => "无需终端向会话输入内容，然后等待并返回输出",
+        "session send/text" => "要输入的文本，原样发送（不含换行，除非加 --enter）",
+        "session send/enter" => "在文本后按回车",
+        "session send/keys" => "文本之后依次按下的按键名（enter、tab、esc、ctrl-c、up、f5、alt-x 等）",
+        "session send/take_control" => "其他客户端持有控制权时，必须带上它才能发送",
+        "session send/no_wait" => "输入被确认后立即返回，不等待输出",
+        "session send/wait_idle" | "session read/wait_idle" => {
+            "连续这么多毫秒没有新输出就返回（send 默认等待 500）"
+        }
+        "session send/wait_for" | "session read/wait_for" => "输出或屏幕匹配该正则表达式时返回（^ 和 $ 按行匹配）",
+        "session send/timeout" | "session read/timeout" => {
+            "等待超过这么多秒就放弃（结果的 reason 为 timeout）"
+        }
+        "session read" => "无需终端读取会话的屏幕，或某个偏移之后的输出",
+        "session read/since" => "返回该偏移之后产生的输出（取自之前结果里的 offset）",
         _ => return None,
     })
 }
@@ -143,6 +169,15 @@ pub struct Cli {
     /// Interface language (en or zh); defaults to TERMBRIDGE_LANG or the system locale
     #[arg(long, global = true, value_enum)]
     pub lang: Option<LangArg>,
+    /// Machine-readable JSON output; never prompts (errors instead) and uses English messages
+    #[arg(long, global = true)]
+    pub json: bool,
+    /// Trust an unknown host whose fingerprint equals this value (never overrides a changed fingerprint)
+    #[arg(long, global = true, value_name = "SHA256")]
+    pub trust_fingerprint: Option<String>,
+    /// Read the password or key passphrase from the first line of stdin
+    #[arg(long, global = true)]
+    pub password_stdin: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -297,6 +332,121 @@ pub enum SessionCommand {
         #[arg(long)]
         take_control: bool,
     },
+    /// Type into a session without a terminal, then wait for and return the output
+    Send {
+        /// Profile name
+        #[arg(short = 'p', long)]
+        profile: String,
+        #[arg(long)]
+        session_id: uuid::Uuid,
+        /// Text to type, sent literally (no newline unless --enter)
+        #[arg(long)]
+        text: Option<String>,
+        /// Press Enter after the text
+        #[arg(long)]
+        enter: bool,
+        /// Named keys sent after the text, in order (enter, tab, esc, ctrl-c, up, f5, alt-x, ...)
+        #[arg(long = "key", value_name = "KEY")]
+        keys: Vec<String>,
+        /// Required to send while another client holds control
+        #[arg(long)]
+        take_control: bool,
+        /// Return as soon as the input is acknowledged instead of waiting for output
+        #[arg(long)]
+        no_wait: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    /// Read a session's screen, or the output since an offset, without a terminal
+    Read {
+        /// Profile name
+        #[arg(short = 'p', long)]
+        profile: String,
+        #[arg(long)]
+        session_id: uuid::Uuid,
+        /// Return the output produced after this offset (the `offset` of an earlier result)
+        #[arg(long)]
+        since: Option<u64>,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+}
+
+/// `session send` / `session read` 的等待条件；满足任意一个就返回。
+#[derive(clap::Args, Clone, Debug)]
+pub struct WaitArgs {
+    /// Return once there has been no new output for this many milliseconds (send waits 500 by default)
+    #[arg(long, value_name = "MS")]
+    wait_idle: Option<u64>,
+    /// Return once the output or the screen matches this regular expression (^ and $ match per line)
+    #[arg(long, value_name = "REGEX")]
+    wait_for: Option<String>,
+    /// Give up waiting after this many seconds (the result then has reason "timeout")
+    #[arg(long, default_value_t = 30, value_name = "SECONDS")]
+    timeout: u64,
+}
+
+/// 全局选项（`--json` / `--trust-fingerprint` / `--password-stdin`），由 `run_cli` 在分发前设置。
+#[derive(Default)]
+struct Options {
+    json: bool,
+    trust_fingerprint: Option<String>,
+    password_stdin: bool,
+}
+
+static OPTIONS: OnceLock<Options> = OnceLock::new();
+
+fn options() -> &'static Options {
+    OPTIONS.get_or_init(Options::default)
+}
+
+fn emit(value: serde_json::Value) {
+    println!("{value}");
+}
+
+/// 出错时的统一输出：`--json` 下是 `{"ok":false,"error":{"code":...,"message":...}}`（写到 stdout），
+/// 否则沿用原来的 `Error: ...` 到 stderr。
+pub fn report_error(err: &anyhow::Error) {
+    if options().json {
+        let coded = err.chain().find_map(|e| e.downcast_ref::<CodedError>());
+        let mut error = json!({
+            "code": coded.map_or("error", |c| c.code.as_str()),
+            "message": format!("{err:#}"),
+        });
+        if let Some(data) = coded.and_then(|c| c.data.clone()) {
+            error["details"] = data;
+        }
+        emit(json!({ "ok": false, "error": error }));
+    } else {
+        eprintln!("Error: {err:?}");
+    }
+}
+
+/// 读取一个秘密（密码或私钥口令）：`--password-stdin` 读 stdin 首行；`--json` 下不提示而是报错；
+/// 否则在终端里提示（不回显）。
+fn read_secret(prompt: String) -> Result<String> {
+    let opts = options();
+    if opts.password_stdin {
+        static SECRET: OnceLock<Option<String>> = OnceLock::new();
+        let secret = SECRET.get_or_init(|| {
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line).ok()?;
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        });
+        return secret.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
+            coded(
+                "prompt_required",
+                "--password-stdin was given but stdin has no password on its first line",
+            )
+        });
+    }
+    if opts.json {
+        return Err(coded(
+            "prompt_required",
+            "a password or key passphrase is required; pass --password-stdin and pipe it in",
+        ));
+    }
+    Ok(rpassword::prompt_password(prompt)?)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -318,11 +468,11 @@ fn prompt_tty(prompt: &str) -> Result<String> {
 }
 
 fn prompt_password(confirm: bool) -> Result<String> {
-    let pw = rpassword::prompt_password(tr!(
+    let pw = read_secret(tr!(
         "Host password (at least 12 characters): ",
         "接收密码（至少 12 个字符）: "
     ))?;
-    if confirm {
+    if confirm && !options().password_stdin {
         let again =
             rpassword::prompt_password(tr!("Enter it again to confirm: ", "再次输入以确认: "))?;
         if pw != again {
@@ -346,39 +496,66 @@ async fn confirmed_fingerprint(host: &str, port: u16) -> Result<HostFingerprint>
             if exp.base64_part() == actual.base64_part() {
                 Ok(actual)
             } else {
-                bail!(
-                    "{}",
+                Err(coded_with(
+                    "fingerprint_changed",
                     tr!(
                         "Host fingerprint changed; connection blocked.\n  Recorded: {}\n  Actual:   {}\nIf the server was legitimately changed, delete the matching entry in {} by hand.",
                         "主机指纹变化，已阻断连接。\n  记录: {}\n  实际: {}\n如确认服务器变更，请手动删除 {} 中对应条目。",
                         exp.sha256,
                         actual.sha256,
                         known_hosts_path().display()
-                    )
-                )
+                    ),
+                    json!({ "recorded": exp.sha256, "actual": actual.sha256 }),
+                ))
             }
         }
         None => {
-            println!(
-                "{}",
-                tr!(
-                    "First connection to {host}:{port}",
-                    "首次连接 {host}:{port}"
-                )
-            );
-            println!(
-                "{}",
-                tr!("Host fingerprint: {}", "主机指纹: {}", actual.sha256)
-            );
-            let answer = prompt_tty(&tr!(
-                "Trust this fingerprint? Type yes to continue: ",
-                "确认并信任该指纹？输入 yes 继续: "
-            ))?;
-            if !answer.eq_ignore_ascii_case("yes") {
-                bail!(tr!(
-                    "Fingerprint not confirmed; connection cancelled",
-                    "未确认指纹，已取消连接"
+            let opts = options();
+            if let Some(pinned) = &opts.trust_fingerprint {
+                // 调用者已经通过可信渠道拿到了指纹：只有与实际一致才信任并记录。
+                if HostFingerprint::new(pinned.clone()).base64_part() != actual.base64_part() {
+                    return Err(coded_with(
+                        "fingerprint_mismatch",
+                        tr!(
+                            "The host fingerprint {} does not match --trust-fingerprint {}",
+                            "主机指纹 {} 与 --trust-fingerprint {} 不一致",
+                            actual.sha256,
+                            pinned
+                        ),
+                        json!({ "actual": actual.sha256 }),
+                    ));
+                }
+            } else if opts.json {
+                return Err(coded_with(
+                    "fingerprint_untrusted",
+                    format!(
+                        "first connection to {key}: the host fingerprint {} is not trusted yet; verify it through a trusted channel and pass --trust-fingerprint",
+                        actual.sha256
+                    ),
+                    json!({ "host": host, "port": port, "fingerprint": actual.sha256 }),
                 ));
+            } else {
+                println!(
+                    "{}",
+                    tr!(
+                        "First connection to {host}:{port}",
+                        "首次连接 {host}:{port}"
+                    )
+                );
+                println!(
+                    "{}",
+                    tr!("Host fingerprint: {}", "主机指纹: {}", actual.sha256)
+                );
+                let answer = prompt_tty(&tr!(
+                    "Trust this fingerprint? Type yes to continue: ",
+                    "确认并信任该指纹？输入 yes 继续: "
+                ))?;
+                if !answer.eq_ignore_ascii_case("yes") {
+                    bail!(tr!(
+                        "Fingerprint not confirmed; connection cancelled",
+                        "未确认指纹，已取消连接"
+                    ));
+                }
             }
             let mut known = known;
             known.entries.insert(key, actual.sha256.clone());
@@ -395,7 +572,12 @@ fn load_profile(name: &str) -> Result<Profile> {
         .items
         .into_iter()
         .find(|p| p.name == name)
-        .with_context(|| tr!("Profile not found: {name}", "档案不存在: {name}"))
+        .ok_or_else(|| {
+            coded(
+                "profile_not_found",
+                tr!("Profile not found: {name}", "档案不存在: {name}"),
+            )
+        })
 }
 
 async fn connect_profile(profile: &Profile) -> Result<Client> {
@@ -411,7 +593,7 @@ async fn connect_profile(profile: &Profile) -> Result<Client> {
             })?;
             let passphrase = match russh::keys::load_secret_key(path, None) {
                 Ok(_) => None,
-                Err(russh::keys::Error::KeyIsEncrypted) => Some(rpassword::prompt_password(tr!(
+                Err(russh::keys::Error::KeyIsEncrypted) => Some(read_secret(tr!(
                     "SSH private key passphrase (not saved): ",
                     "SSH 私钥口令（不保存）: "
                 ))?),
@@ -443,6 +625,12 @@ async fn connect_profile(profile: &Profile) -> Result<Client> {
         fp,
     ))
     .await
+    .map_err(|e| {
+        coded(
+            "connect_failed",
+            format!("{}: {e:#}", tr!("Connection failed", "连接失败")),
+        )
+    })
 }
 
 fn load_password(profile: &Profile) -> Result<String> {
@@ -454,12 +642,12 @@ fn load_password(profile: &Profile) -> Result<String> {
             }
         }
     }
-    Ok(rpassword::prompt_password(tr!(
+    read_secret(tr!(
         "Password for {}@{}: ",
         "{}@{} 的密码: ",
         profile.user,
         profile.host
-    ))?)
+    ))
 }
 
 fn store_password(profile_name: &str, password: &str) -> Result<()> {
@@ -470,13 +658,13 @@ fn expect_response(resp: Response, what: &str) -> Result<Response> {
     match resp {
         Response::Error { code, message } => {
             let message = crate::i18n::wire_message(&code, &message);
-            bail!(
-                "{}",
+            Err(coded(
+                &code,
                 tr!(
                     "{what} failed [{code}]: {message}",
                     "{what} 失败 [{code}]: {message}"
-                )
-            )
+                ),
+            ))
         }
         other => Ok(other),
     }
@@ -513,8 +701,16 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
+    let _ = OPTIONS.set(Options {
+        json: cli.json,
+        trust_fingerprint: cli.trust_fingerprint.clone(),
+        password_stdin: cli.password_stdin,
+    });
     if let Some(lang) = cli.lang {
         crate::i18n::set_lang(lang.into());
+    } else if cli.json {
+        // 机器可读输出里的消息保持英文，不随系统语言变化。
+        crate::i18n::set_lang(Lang::En);
     }
     match cli.command {
         Command::Host { command } => run_host(command).await,
@@ -550,6 +746,20 @@ async fn run_host(cmd: HostCommand) -> Result<()> {
         }
         HostCommand::Status => {
             let cfg: HostConfig = read_json(&config::host_path())?;
+            if options().json {
+                let initialized = config::host_path().exists();
+                emit(json!({
+                    "ok": true,
+                    "initialized": initialized,
+                    "username": initialized.then(|| cfg.username.clone()),
+                    "enabled": cfg.enabled,
+                    "listen": cfg.listen.as_deref().unwrap_or(DEFAULT_LISTEN),
+                    "password_auth": cfg.password_hash.is_some(),
+                    "authorized_keys": cfg.authorized_keys.len(),
+                    "fingerprint": if initialized { cfg.fingerprint().ok() } else { None },
+                }));
+                return Ok(());
+            }
             if config::host_path().exists() {
                 let fp = cfg
                     .fingerprint()
@@ -777,7 +987,7 @@ async fn run_profile(cmd: ProfileCommand) -> Result<()> {
                 remember_password,
             };
             if remember_password && matches!(profile.auth, config::AuthKind::Password) {
-                let pw = rpassword::prompt_password(tr!(
+                let pw = read_secret(tr!(
                     "Password for {}@{}: ",
                     "{}@{} 的密码: ",
                     profile.user,
@@ -787,10 +997,34 @@ async fn run_profile(cmd: ProfileCommand) -> Result<()> {
             }
             profiles.items.push(profile);
             save_json(&profiles_path(), &profiles)?;
-            println!("{}", tr!("Profile saved", "档案已保存"));
+            if options().json {
+                let saved = profiles.items.last().map(|p| p.name.clone());
+                emit(json!({ "ok": true, "profile": saved }));
+            } else {
+                println!("{}", tr!("Profile saved", "档案已保存"));
+            }
         }
         ProfileCommand::List => {
             let profiles: Profiles = read_json(&profiles_path())?;
+            if options().json {
+                let items: Vec<_> = profiles
+                    .items
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "name": p.name,
+                            "host": p.host,
+                            "port": p.port,
+                            "user": p.user,
+                            "auth": format!("{:?}", p.auth).to_lowercase(),
+                            "key_path": p.key_path,
+                            "remember_password": p.remember_password,
+                        })
+                    })
+                    .collect();
+                emit(json!({ "ok": true, "profiles": items }));
+                return Ok(());
+            }
             if profiles.items.is_empty() {
                 println!("{}", tr!("(no profiles)", "（无档案）"));
             }
@@ -816,7 +1050,11 @@ async fn run_profile(cmd: ProfileCommand) -> Result<()> {
                 }
             }
             save_json(&profiles_path(), &profiles)?;
-            println!("{}", tr!("Profile removed: {name}", "档案已删除: {name}"));
+            if options().json {
+                emit(json!({ "ok": true, "removed": name }));
+            } else {
+                println!("{}", tr!("Profile removed: {name}", "档案已删除: {name}"));
+            }
         }
     }
     Ok(())
@@ -846,6 +1084,60 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
                 take_control,
             },
         ),
+        SessionCommand::Send {
+            profile,
+            session_id,
+            text,
+            enter,
+            keys,
+            take_control,
+            no_wait,
+            wait,
+        } => {
+            // 连接之前先校验参数：按键名写错不该白白建立一次连接。
+            let mut data = text.unwrap_or_default().into_bytes();
+            if enter {
+                data.push(b'\r');
+            }
+            for key in &keys {
+                let bytes = agent::key_bytes(key)
+                    .ok_or_else(|| coded("invalid_args", format!("unknown key name: {key}")))?;
+                data.extend_from_slice(&bytes);
+            }
+            if data.is_empty() {
+                return Err(coded(
+                    "invalid_args",
+                    "nothing to send: pass --text, --enter or --key",
+                ));
+            }
+            let spec = wait_spec(&wait, Some(500), !no_wait)?;
+            (
+                profile,
+                SessionAction::Send {
+                    session_id,
+                    data,
+                    take_control,
+                    spec,
+                    settle: !no_wait,
+                },
+            )
+        }
+        SessionCommand::Read {
+            profile,
+            session_id,
+            since,
+            wait,
+        } => {
+            let spec = wait_spec(&wait, None, true)?;
+            (
+                profile,
+                SessionAction::Read {
+                    session_id,
+                    since,
+                    spec,
+                },
+            )
+        }
     };
     if matches!(action, SessionAction::Attach { .. }) && !std::io::stdin().is_terminal() {
         bail!(tr!(
@@ -854,14 +1146,16 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
         ));
     }
     let profile = load_profile(&profile_name)?;
-    let mut client = connect_profile(&profile)
-        .await
-        .with_context(|| tr!("Connection failed", "连接失败"))?;
+    let mut client = connect_profile(&profile).await?;
     let result = match action {
         SessionAction::List => {
             let resp = expect_response(client.request(Request::List).await?, "list")?;
             if let Response::Sessions { sessions } = resp {
-                print_sessions(&sessions);
+                if options().json {
+                    emit(json!({ "ok": true, "sessions": sessions }));
+                } else {
+                    print_sessions(&sessions);
+                }
             }
             Ok(())
         }
@@ -874,10 +1168,14 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
                 "create",
             )?;
             if let Response::Created { session } = resp {
-                println!(
-                    "{}",
-                    tr!("Session created: {}", "会话已创建: {}", session.id)
-                );
+                if options().json {
+                    emit(json!({ "ok": true, "session": session }));
+                } else {
+                    println!(
+                        "{}",
+                        tr!("Session created: {}", "会话已创建: {}", session.id)
+                    );
+                }
             }
             Ok(())
         }
@@ -904,10 +1202,13 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
             };
             if !has_control {
                 if !take_control {
-                    bail!(tr!(
-                        "Another client holds control; pass --take-control explicitly",
-                        "另一客户端持有控制权；请显式使用 --take-control"
-                    ))
+                    return Err(coded(
+                        "not_controller",
+                        tr!(
+                            "Another client holds control; pass --take-control explicitly",
+                            "另一客户端持有控制权；请显式使用 --take-control"
+                        ),
+                    ));
                 }
                 expect_response(
                     client.request(Request::TakeControl { session_id }).await?,
@@ -915,13 +1216,39 @@ async fn run_session(cmd: SessionCommand) -> Result<()> {
                 )?;
             }
             expect_response(client.request(Request::End { session_id }).await?, "end")?;
-            println!(
-                "{}",
-                tr!("Session ended: {session_id}", "会话已结束: {session_id}")
-            );
+            if options().json {
+                emit(json!({ "ok": true, "session_id": session_id }));
+            } else {
+                println!(
+                    "{}",
+                    tr!("Session ended: {session_id}", "会话已结束: {session_id}")
+                );
+            }
             Ok(())
         }
         SessionAction::Attach { session_id } => raw::attach_raw(&mut client, session_id).await,
+        SessionAction::Send {
+            session_id,
+            data,
+            take_control,
+            spec,
+            settle,
+        } => {
+            agent_send(
+                &mut client,
+                session_id,
+                &data,
+                take_control,
+                spec.as_ref(),
+                settle,
+            )
+            .await
+        }
+        SessionAction::Read {
+            session_id,
+            since,
+            spec,
+        } => agent_read(&mut client, session_id, since, spec.as_ref()).await,
     };
     client.disconnect().await.ok();
     result
@@ -941,6 +1268,135 @@ enum SessionAction {
         session_id: uuid::Uuid,
         take_control: bool,
     },
+    Send {
+        session_id: uuid::Uuid,
+        data: Vec<u8>,
+        take_control: bool,
+        spec: Option<agent::WaitSpec>,
+        settle: bool,
+    },
+    Read {
+        session_id: uuid::Uuid,
+        since: Option<u64>,
+        spec: Option<agent::WaitSpec>,
+    },
+}
+
+/// 把等待参数变成等待条件。`default_idle` 是没写任何条件时的默认空闲时长，`enabled` 为 false
+/// 表示不等待。
+fn wait_spec(
+    args: &WaitArgs,
+    default_idle: Option<u64>,
+    enabled: bool,
+) -> Result<Option<agent::WaitSpec>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let idle = args.wait_idle.or(if args.wait_for.is_some() {
+        None
+    } else {
+        default_idle
+    });
+    if idle.is_none() && args.wait_for.is_none() {
+        return Ok(None);
+    }
+    // 多行模式：`^` / `$` 匹配每一行的行首行尾，而不只是整段输出的首尾。
+    let until = args
+        .wait_for
+        .as_deref()
+        .map(|pattern| regex::RegexBuilder::new(pattern).multi_line(true).build())
+        .transpose()
+        .map_err(|e| {
+            coded(
+                "invalid_args",
+                format!("invalid --wait-for regular expression: {e}"),
+            )
+        })?;
+    Ok(Some(agent::WaitSpec {
+        idle: idle.map(Duration::from_millis),
+        until,
+        timeout: Duration::from_secs(args.timeout.clamp(1, 3600)),
+    }))
+}
+
+/// 发送输入（必要时先接管），等到接收端确认，再按等待条件收集输出。
+async fn agent_send(
+    client: &mut Client,
+    session_id: uuid::Uuid,
+    data: &[u8],
+    take_control: bool,
+    spec: Option<&agent::WaitSpec>,
+    settle: bool,
+) -> Result<()> {
+    let mut collector = agent::Collector::new(session_id, None);
+    let attachment = agent::attach(client, session_id, None).await?;
+    agent::wait_snapshot(client, &mut collector).await?;
+    agent::ensure_control(client, session_id, attachment.has_control, take_control).await?;
+    let input_offset = agent::send_input(
+        client,
+        &mut collector,
+        session_id,
+        attachment.stream_id,
+        attachment.input_next,
+        data,
+    )
+    .await?;
+    let reason = agent::wait_for(client, &mut collector, spec, settle).await?;
+    let extra = json!({ "sent_bytes": data.len(), "input_offset": input_offset });
+    print_observation(session_id, &attachment.session, &collector, reason, extra);
+    Ok(())
+}
+
+/// 读取屏幕，或读取某个偏移之后的输出。
+async fn agent_read(
+    client: &mut Client,
+    session_id: uuid::Uuid,
+    since: Option<u64>,
+    spec: Option<&agent::WaitSpec>,
+) -> Result<()> {
+    let mut collector = agent::Collector::new(session_id, since);
+    let attachment = agent::attach(client, session_id, since).await?;
+    if !attachment.resumed {
+        agent::wait_snapshot(client, &mut collector).await?;
+    }
+    let reason = agent::wait_for(client, &mut collector, spec, true).await?;
+    // 指定了 since 但接收端已经回收了那段输出，只能退回到当前画面。
+    let extra = json!({ "since_unavailable": since.is_some() && !attachment.resumed });
+    print_observation(session_id, &attachment.session, &collector, reason, extra);
+    Ok(())
+}
+
+/// `send` / `read` 的结果：JSON 下输出完整对象；文本下输出新输出，没有则输出屏幕。
+fn print_observation(
+    session_id: uuid::Uuid,
+    session: &SessionInfo,
+    collector: &agent::Collector,
+    reason: agent::Reason,
+    extra: serde_json::Value,
+) {
+    let output = collector.output_text();
+    let screen = collector.screen_view();
+    if options().json {
+        let mut value = json!({
+            "ok": true,
+            "session_id": session_id,
+            "live": session.live && !collector.ended,
+            "reason": reason,
+            "offset": collector.end_offset,
+            "output": output,
+            "output_truncated": collector.truncated,
+            "output_gap": collector.gap,
+            "screen": screen,
+        });
+        if let (Some(map), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            map.extend(extra.clone());
+        }
+        emit(value);
+    } else if !output.is_empty() {
+        println!("{output}");
+    } else if let Some(screen) = screen {
+        println!("{}", screen.lines.join("\n"));
+    }
 }
 
 #[cfg(test)]

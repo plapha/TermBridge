@@ -15,6 +15,7 @@ Every device with TermBridge installed can act as both a host and a client. The 
 - A session can be viewed by several clients at once, but only one client can type at a time.
 - SSH public-key authentication and a separate password authentication are supported. The host fingerprint is confirmed on first connection.
 - A desktop GUI and a `termbridge` command-line tool are provided, both in English and Simplified Chinese (see [Language](#language)).
+- Scripts and AI agents can drive sessions without a terminal, through `--json` commands (see [Agent and script interface](#agent-and-script-interface)).
 - Runs on Windows, Linux and macOS.
 
 TermBridge uses its own SSH subsystem protocol (`termbridge-v2`). It is not interoperable with standard SSH clients or servers, and it provides no relay or NAT traversal.
@@ -105,6 +106,34 @@ Local shortcuts use Ctrl+] as a prefix; pressing any other key after the prefix 
 | Ctrl+] t | Take over control |
 | Ctrl+] e | End the remote session; press Ctrl+] e again within 3 seconds to confirm |
 | Ctrl+] Ctrl+] | Send a literal Ctrl+] to the remote side |
+
+## Agent and script interface
+
+Everything an agent needs is available as non-interactive commands with machine-readable output. Add `--json` to `profile`, `session` and `host status` commands: a success prints one JSON object with `"ok": true` on stdout, a failure prints `{"ok": false, "error": {"code": ..., "message": ...}}` on stdout and exits with status 1. With `--json` the commands never prompt (they fail with `prompt_required` instead) and messages are always English.
+
+Connecting without a person at the keyboard:
+
+- `--trust-fingerprint SHA256:...` trusts an unknown host whose fingerprint equals the given value and remembers it. Get the value from a trusted channel, for example `termbridge host status` on the host. Without it, the first connection fails with `fingerprint_untrusted` and the observed fingerprint in `error.details.fingerprint`. A fingerprint that changed since it was recorded is always refused (`fingerprint_changed`).
+- `--password-stdin` reads the password (or the key passphrase) from the first line of stdin. With key authentication and an unencrypted key nothing is needed.
+
+Working in a session, either in a new one (the agent's own "tab") or an existing one (for example the one a person has open):
+
+```sh
+termbridge --json session create -p a-box --title agent          # new session; returns session.id
+termbridge --json session list   -p a-box                         # existing sessions
+termbridge --json session send   -p a-box --session-id <UUID> --take-control \
+    --text 'make test' --enter --wait-for '^(PASS|FAIL)' --timeout 600
+termbridge --json session read   -p a-box --session-id <UUID>                 # current screen
+termbridge --json session read   -p a-box --session-id <UUID> --since <offset> # output since an offset
+termbridge --json session end    -p a-box --session-id <UUID> --take-control
+```
+
+- `send` types `--text` literally, presses Enter with `--enter`, then sends each `--key` in order (`enter`, `tab`, `esc`, `backspace`, `space`, `up`/`down`/`left`/`right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `f1`–`f12`, `ctrl-<letter>`, `alt-<char>`). Invalid arguments are rejected before connecting.
+- `send` returns when the input has been acknowledged by the host and a wait condition is met: `--wait-idle MS` (no new output for that long; 500 by default), `--wait-for REGEX` (the output or the screen matches; `^` and `$` match per line) or `--timeout SECONDS` (default 30). `--no-wait` returns right after the acknowledgement. `read` returns immediately unless wait flags are given. Use a pattern the typed command line itself does not contain, because the terminal echoes what you type.
+- The result contains `reason` (`idle`, `match`, `timeout`, `ended` or `immediate`), `output` (plain text produced since the command attached; escape sequences are stripped on a best-effort basis), `screen` (`lines`, `rows`, `cols`, cursor position, `alternate_screen`), and `offset`, the output position to pass as `--since` next time. `read --since` returns only the output, and `since_unavailable` is true if the host no longer keeps that part (the screen is returned instead).
+- Only the controller's input reaches the terminal. If another client (for example a person's window) holds control, `send` fails with `not_controller`; pass `--take-control` to take it over. Control also stays with a client for 60 seconds after it disconnects, so an agent that sends several commands in a row should pass `--take-control` each time. The agent never changes the terminal size.
+- Input is delivered exactly once by offset. If the connection drops or the host does not acknowledge in time, `send` fails with `input_state_unknown` or `input_unconfirmed` and does not resend; read the screen to see what happened.
+- Reading a session gives the agent everything on that terminal, including secrets that were printed there. TermBridge itself does not log terminal input or output.
 
 ## Language
 

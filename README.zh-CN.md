@@ -15,6 +15,7 @@ TermBridge 是一个跨平台的远程终端工具。终端会话运行在接收
 - 同一会话可以被多个客户端同时查看，同一时间只有一个客户端可以输入
 - 支持 SSH 公钥认证和独立密码认证，首次连接时确认主机指纹
 - 提供桌面图形界面和 `termbridge` 命令行工具，均支持英文和简体中文（见[界面语言](#界面语言)）
+- 脚本和 AI Agent 无需真实终端，通过 `--json` 命令即可操作会话（见[Agent 与脚本接口](#agent-与脚本接口)）
 - 支持 Windows、Linux、macOS
 
 TermBridge 使用自定义的 SSH 子系统协议（`termbridge-v2`），不能与标准 SSH 客户端或服务端互通，也不提供中继和 NAT 穿透。
@@ -105,6 +106,34 @@ termbridge session end    -p a-box --session-id <UUID>
 | Ctrl+] t | 接管控制权 |
 | Ctrl+] e | 结束远端会话，需在 3 秒内再按一次 Ctrl+] e 确认 |
 | Ctrl+] Ctrl+] | 向远端发送 Ctrl+] |
+
+## Agent 与脚本接口
+
+Agent 需要的功能都提供了非交互命令和机器可读的输出。在 `profile`、`session` 和 `host status` 命令上加 `--json`：成功时在 stdout 输出一个带 `"ok": true` 的 JSON 对象；失败时在 stdout 输出 `{"ok": false, "error": {"code": ..., "message": ...}}` 并以状态码 1 退出。`--json` 下命令不会提示输入（需要时以 `prompt_required` 报错），消息固定为英文。
+
+没有人在键盘前时如何连接：
+
+- `--trust-fingerprint SHA256:...`：信任指纹等于该值的未知主机并记录。指纹要从可信渠道取得，例如在接收端执行 `termbridge host status`。不带它时，首次连接会以 `fingerprint_untrusted` 失败，实际看到的指纹在 `error.details.fingerprint` 里。已记录的指纹发生变化时一律拒绝（`fingerprint_changed`）。
+- `--password-stdin`：从标准输入的第一行读取密码（或私钥口令）。使用 SSH 私钥且私钥没有口令时什么都不需要。
+
+在会话里工作，可以用新会话（Agent 自己的“标签页”），也可以用已有会话（比如有人正开着的那个）：
+
+```sh
+termbridge --json session create -p a-box --title agent          # 新会话，返回 session.id
+termbridge --json session list   -p a-box                         # 已有会话
+termbridge --json session send   -p a-box --session-id <UUID> --take-control \
+    --text 'make test' --enter --wait-for '^(PASS|FAIL)' --timeout 600
+termbridge --json session read   -p a-box --session-id <UUID>                 # 当前屏幕
+termbridge --json session read   -p a-box --session-id <UUID> --since <offset> # 某个偏移之后的输出
+termbridge --json session end    -p a-box --session-id <UUID> --take-control
+```
+
+- `send` 把 `--text` 原样输入，`--enter` 再按回车，然后依次按下每个 `--key`（`enter`、`tab`、`esc`、`backspace`、`space`、`up`/`down`/`left`/`right`、`home`、`end`、`pageup`、`pagedown`、`delete`、`f1`–`f12`、`ctrl-<字母>`、`alt-<字符>`）。参数错误会在连接之前被拒绝。
+- `send` 在接收端确认收到输入并满足等待条件后返回：`--wait-idle 毫秒`（这么久没有新输出，默认 500）、`--wait-for 正则`（输出或屏幕匹配，`^` 和 `$` 按行匹配）或 `--timeout 秒`（默认 30）。`--no-wait` 在确认后立即返回。`read` 不带等待参数时立即返回。正则要避开你输入的命令行本身，因为终端会回显你输入的内容。
+- 结果里有 `reason`（`idle`、`match`、`timeout`、`ended` 或 `immediate`）、`output`（附着之后产生的纯文本，转义序列尽力去除）、`screen`（`lines`、`rows`、`cols`、光标位置、`alternate_screen`），以及 `offset`，即下次传给 `--since` 的输出位置。`read --since` 只返回输出；如果接收端已不再保留那段输出，`since_unavailable` 为 true，并改为返回屏幕。
+- 只有控制者的输入会写入终端。其他客户端（比如有人正用的窗口）持有控制权时，`send` 会以 `not_controller` 失败，加 `--take-control` 才能接管。客户端断开后控制权还会保留 60 秒，所以连续发送多条命令的 Agent 每次都应带上 `--take-control`。Agent 不会改变终端尺寸。
+- 输入按偏移保证恰好一次。连接断开或接收端没有及时确认时，`send` 以 `input_state_unknown` 或 `input_unconfirmed` 失败且不会重发，请读取屏幕确认发生了什么。
+- 读取会话意味着 Agent 能看到该终端上的全部内容，包括被打印出来的机密。TermBridge 自己不记录终端的输入和输出。
 
 ## 界面语言
 

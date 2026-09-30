@@ -4718,6 +4718,7 @@ dependencies = [
  "keyring",
  "rand",
  "rand_core 0.6.4",
+ "regex",
  "rpassword",
  "russh",
  "serde",
@@ -4726,6 +4727,7 @@ dependencies = [
  "termbridge-protocol",
  "tokio",
  "uuid",
+ "vt100",
  "windows-sys 0.61.2",
 ]
 
@@ -4753,6 +4755,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "libc",
  "portable-pty",
  "termbridge-protocol",
  "tokio",
