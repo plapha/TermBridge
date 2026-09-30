@@ -1,217 +1,221 @@
 # TermBridge
 
-TermBridge 是一个跨平台的远程终端工具。终端会话运行在接收端，客户端断开后会话继续运行，重新连接时恢复当前画面。
+**English** | [简体中文](README.zh-CN.md)
 
-每台安装了 TermBridge 的设备都可以同时作为接收端和连接端。传输层使用 SSH，接收端内置基于 [russh](https://github.com/Eugeny/russh) 的 SSH 服务，适用于局域网、Tailscale 等可以直接访问的网络。
+TermBridge is a cross-platform remote terminal tool. Terminal sessions live on the host; when a client disconnects the session keeps running, and reconnecting restores the current screen.
 
-> 当前版本 0.2.0，处于开发阶段，详见[开发状态](#开发状态)。
+Every device with TermBridge installed can act as both a host and a client. The transport is SSH: the host embeds an SSH server built on [russh](https://github.com/Eugeny/russh), and it is intended for networks where the host is directly reachable, such as a LAN or Tailscale.
 
-## 功能
+> Current version: 0.2.0, under active development. See [Development status](#development-status).
 
-- 会话在接收端持续运行，客户端断开或网络中断不影响会话，重新附着时恢复画面并继续接收输出
-- 按键实时发送，支持 vim、htop、less 等全屏程序
-- 同一会话可以被多个客户端同时查看，同一时间只有一个客户端可以输入
-- 支持 SSH 公钥认证和独立密码认证，首次连接时确认主机指纹
-- 提供桌面图形界面和 `termbridge` 命令行工具
-- 支持 Windows、Linux、macOS
+## Features
 
-TermBridge 使用自定义的 SSH 子系统协议（`termbridge-v2`），不能与标准 SSH 客户端或服务端互通，也不提供中继和 NAT 穿透。
+- Sessions keep running on the host. A client disconnect or network drop does not affect them; re-attaching restores the screen and resumes the output stream.
+- Keystrokes are sent in real time, so full-screen programs such as vim, htop and less work.
+- A session can be viewed by several clients at once, but only one client can type at a time.
+- SSH public-key authentication and a separate password authentication are supported. The host fingerprint is confirmed on first connection.
+- A desktop GUI and a `termbridge` command-line tool are provided.
+- Runs on Windows, Linux and macOS.
 
-## 安装
+TermBridge uses its own SSH subsystem protocol (`termbridge-v2`). It is not interoperable with standard SSH clients or servers, and it provides no relay or NAT traversal.
 
-从 [Releases](https://github.com/plapha/TermBridge/releases) 下载对应平台的安装包：
+## Installation
 
-| 平台 | 安装包 |
+Download the package for your platform from [Releases](https://github.com/plapha/TermBridge/releases):
+
+| Platform | Package |
 |---|---|
-| Windows 10/11 x64 | `TermBridge_<版本>_x64-setup.exe` |
-| Debian / Ubuntu x86_64 | `TermBridge_<版本>_amd64.deb` |
-| macOS（Apple Silicon / Intel） | `TermBridge_<版本>_universal.dmg` |
+| Windows 10/11 x64 | `TermBridge_<version>_x64-setup.exe` |
+| Debian / Ubuntu x86_64 | `TermBridge_<version>_amd64.deb` |
+| macOS (Apple Silicon / Intel) | `TermBridge_<version>_universal.dmg` |
 
-安装包内附带同版本的 `termbridge` 命令行工具。0.2 与 0.1.x 的协议不兼容，连接双方都需要升级到 0.2。
+Each package ships with the `termbridge` command-line tool of the same version. 0.2 is not protocol-compatible with 0.1.x, so both ends of a connection must be upgraded to 0.2.
 
-安装包未做代码签名。Windows 出现 SmartScreen 提示时，选择「更多信息」→「仍要运行」。macOS 首次打开时右键点击应用并选择「打开」；如果提示应用已损坏，执行：
+The packages are not code-signed. If Windows shows a SmartScreen warning, choose "More info" → "Run anyway". On macOS, right-click the app the first time and choose "Open". If macOS reports that the app is damaged, run:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/TermBridge.app
 ```
 
-## 基本概念
+## Concepts
 
-| 术语 | 说明 |
+| Term | Description |
 |---|---|
-| 接收端 | 被连接的一方，负责创建和保存会话，默认不启用 |
-| 连接端 | 发起连接的一方，使用图形界面或命令行 |
-| 连接配置 | 连接端保存的地址、端口、用户名和认证方式（profile） |
-| 会话 | 接收端上的一个终端，以 UUID 标识。Windows 上为 PowerShell，其他系统为用户的默认 shell |
-| 控制权 | 会话的输入权限。首个附着的客户端获得控制权，其他客户端需要接管后才能输入 |
-| 主机指纹 | 接收端 SSH 主机密钥的 SHA256 指纹。首次连接时确认，之后不一致即拒绝连接 |
+| Host | The side being connected to. It creates and holds the sessions. Disabled by default. |
+| Client | The side that initiates the connection, using the GUI or the command line. |
+| Profile | A saved connection on the client: address, port, username and authentication method. |
+| Session | A terminal on the host, identified by a UUID. It is PowerShell on Windows and the user's default shell elsewhere. |
+| Control | The right to type into a session. The first client to attach gets control; other clients must take it over before they can type. |
+| Host fingerprint | The SHA256 fingerprint of the host's SSH host key. It is confirmed on first connection; a later mismatch causes the connection to be refused. |
 
-## 使用
+## Usage
 
-以下以 A 作为接收端、B 作为连接端为例。
+The examples below use A as the host and B as the client.
 
-### 启用接收端（A）
+### Enable the host (A)
 
-图形界面：在「本应用接收端」面板中选择认证方式并初始化，设置监听地址和端口后点击「启用」。
+The desktop GUI is currently available in Chinese only; button and panel names are given below in English with the original Chinese label in parentheses.
 
-命令行：
+GUI: in the local receiver panel (「本应用接收端」), choose an authentication method and initialize (「初始化」), set the listen address and port, then click Enable (「启用」).
+
+Command line:
 
 ```sh
-termbridge host init --authorized-keys ~/.ssh/authorized_keys   # 使用 SSH 公钥认证（推荐）
-termbridge host init                                            # 或使用独立密码认证，至少 12 个字符
+termbridge host init --authorized-keys ~/.ssh/authorized_keys   # SSH public-key authentication (recommended)
+termbridge host init                                            # or a separate password, at least 12 characters
 
-termbridge host status                             # 查看主机指纹、登录用户名和认证方式
-termbridge host enable --listen 100.64.0.5:22333   # 设置监听地址
-termbridge host run                                # 前台运行，Ctrl+C 停止
+termbridge host status                             # show the host fingerprint, login username and authentication method
+termbridge host enable --listen 100.64.0.5:22333   # set the listen address
+termbridge host run                                # run in the foreground; stop with Ctrl+C
 ```
 
-- 登录用户名为初始化时的系统用户名，可通过 `host status` 查看。
-- 监听地址需要显式指定。仅在本机测试时可使用 `127.0.0.1:22333`，不建议在不可信网络中监听 `0.0.0.0`。
-- `authorized_keys` 中带有 `from=`、`command=` 等选项的条目不受支持，导入时会报错。
-- 修改认证配置后需要重启接收端。
+- The login username is the system username at the time of initialization. Check it with `host status`.
+- The listen address must be given explicitly. `127.0.0.1:22333` is fine for local testing only; listening on `0.0.0.0` on an untrusted network is not recommended.
+- Entries in `authorized_keys` that carry options such as `from=` or `command=` are not supported and cause an error on import.
+- Restart the host after changing the authentication configuration.
 
-### 连接（B）
+### Connect (B)
 
-图形界面：在「连接配置」中新建配置，填写主机、端口、用户名和认证方式。保存后点击「新建终端」创建会话，或点击「已有终端」附着到正在运行的会话。首次连接时会显示主机指纹，请与 A 上 `host status` 的输出核对后再确认。
+GUI: create a profile in the connection profiles panel (「连接配置」) with the host, port, username and authentication method. After saving, click New terminal (「新建终端」) to create a session, or Existing terminals (「已有终端」) to attach to a running one. On first connection the host fingerprint is shown; compare it with the output of `host status` on A before confirming.
 
-会话标签上的「接管输入」用于获取控制权，「分离」断开当前客户端并保留会话，「终止」结束会话。
+On a session tab, Take control (「接管输入」) acquires control, Detach (「分离」) disconnects this client and keeps the session alive, and Terminate (「终止」) ends the session.
 
-命令行：
+Command line:
 
 ```sh
-termbridge profile add a-box 100.64.0.5 --port 22333 -u <用户名> --auth key
+termbridge profile add a-box 100.64.0.5 --port 22333 -u <username> --auth key
 termbridge session create -p a-box --title build
 termbridge session list   -p a-box
 termbridge session attach -p a-box --session-id <UUID>
 termbridge session end    -p a-box --session-id <UUID>
 ```
 
-- `--auth key` 使用 SSH 私钥，默认依次查找 `~/.ssh/id_ed25519`、`id_ecdsa`、`id_rsa`，可通过 `--key-path` 指定。省略 `--auth` 时使用独立密码，连接时输入；加 `--remember-password` 可保存到系统凭据库。
-- 首次连接时会显示主机指纹，输入 `yes` 确认。
-- `session attach` 省略 `--session-id` 时附着到第一个运行中的会话。
-- 会话正被其他客户端控制时，`session end` 需要加 `--take-control`。
+- `--auth key` uses an SSH private key. By default `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa` are tried in that order; use `--key-path` to specify one. Without `--auth`, the separate password is used and is entered at connect time; add `--remember-password` to store it in the system credential store.
+- On first connection the host fingerprint is displayed; type `yes` to confirm.
+- If `--session-id` is omitted, `session attach` attaches to the first running session.
+- When another client holds control of the session, `session end` needs `--take-control`.
 
-### 命令行附着
+### Attaching from the command line
 
-`session attach` 会将本地终端切换到 raw 模式，按键原样发送到远端，退出时恢复终端设置。该命令需要在交互式终端中运行，不支持管道输入。
+`session attach` switches the local terminal to raw mode, sends keystrokes to the remote side unchanged, and restores the terminal settings on exit. It must be run in an interactive terminal and does not support piped input.
 
-本地快捷键以 Ctrl+] 为前缀，前缀后按其他键则取消：
+Local shortcuts use Ctrl+] as a prefix; pressing any other key after the prefix cancels it:
 
-| 按键 | 功能 |
+| Keys | Action |
 |---|---|
-| Ctrl+] d | 分离，远端会话继续运行 |
-| Ctrl+] t | 接管控制权 |
-| Ctrl+] e | 结束远端会话，需在 3 秒内再按一次 Ctrl+] e 确认 |
-| Ctrl+] Ctrl+] | 向远端发送 Ctrl+] |
+| Ctrl+] d | Detach; the remote session keeps running |
+| Ctrl+] t | Take over control |
+| Ctrl+] e | End the remote session; press Ctrl+] e again within 3 seconds to confirm |
+| Ctrl+] Ctrl+] | Send a literal Ctrl+] to the remote side |
 
-## 会话生命周期
+## Session lifecycle
 
-- 客户端断开、退出或网络中断时，会话继续运行。重新附着后先收到当前画面，再接收后续输出。目前不支持自动重连。
-- 终端中的 shell 退出（例如执行 `exit`）后，会话立即移除并释放资源，已附着的客户端会收到结束通知。
-- 接收端停止时（Ctrl+C、图形界面中点击「停止本应用接收」、从托盘退出），其上的所有会话一并结束。Windows 上通过 Job Object 结束终端内启动的全部子进程，接收端异常退出时同样生效；Linux 和 macOS 上按会话（sid）结束 shell 及其启动的全部进程，包括后台任务、`nohup` 启动的进程和忽略 SIGHUP 的进程。主动调用 `setsid` 脱离会话的守护进程不受影响，接收端被强杀（SIGKILL）时也不会清理。
-- 会话仅保存在内存中，接收端或系统重启后不会恢复。
+- When a client disconnects, exits or loses its network, the session keeps running. After re-attaching, the client first receives the current screen and then the subsequent output. Automatic reconnection is not supported yet.
+- When the shell in a terminal exits (for example via `exit`), the session is removed immediately and its resources are released; attached clients receive an end notification.
+- When the host stops (Ctrl+C, "Stop local receiver" (「停止本应用接收」) in the GUI, or quitting from the tray), all of its sessions end. On Windows, a Job Object terminates every child process started inside the terminal, including when the host exits abnormally. On Linux and macOS, the shell and every process it started are terminated per session (sid), including background jobs, processes started with `nohup` and processes that ignore SIGHUP. Daemons that deliberately leave the session with `setsid` are not affected, and nothing is cleaned up if the host is killed with SIGKILL.
+- Sessions are kept in memory only and are not restored after the host or the system restarts.
 
-## 安全
+## Security
 
-- 推荐使用 SSH 公钥认证。使用独立密码时，接收端只保存其 Argon2 哈希，不读取也不校验系统账户密码。
-- 同一 IP 连续认证失败 5 次后，10 分钟内拒绝该 IP 的连接。
-- 主机指纹在首次连接时由用户确认，之后指纹变化即拒绝连接。TermBridge 使用独立的主机密钥，与系统 OpenSSH 的主机密钥无关。
-- 输入按字节偏移编号并由接收端确认，重复数据会被丢弃，缺失部分从确认点重发。无法确定对端接收状态时（如断线），客户端丢弃未确认的输入并给出提示，不会自动重发。
-- 只有持有控制权的客户端的输入会写入终端。
-- 密码和图形界面记住的指纹优先保存在系统凭据库（Windows 凭据管理器、macOS 钥匙串、Linux Secret Service）。凭据库不可用时，指纹保存在权限受限的 `known_hosts.json` 中，密码在每次连接时输入。
-- 私钥只从原路径读取，不会复制，私钥口令不会保存。日志中不记录密码和终端原始输出。
+- SSH public-key authentication is recommended. With a separate password, the host stores only its Argon2 hash; it neither reads nor verifies system account passwords.
+- After 5 consecutive authentication failures from the same IP, connections from that IP are rejected for 10 minutes.
+- The host fingerprint is confirmed by the user on first connection, and a changed fingerprint is refused afterwards. TermBridge uses its own host key, independent of the system OpenSSH host keys.
+- Input is numbered by byte offset and acknowledged by the host. Duplicate data is discarded, and missing data is resent from the acknowledged point. When the peer's receive state cannot be determined (for example after a disconnect), the client discards unacknowledged input and shows a notice instead of resending it automatically.
+- Only input from the client that holds control is written to the terminal.
+- Passwords and fingerprints remembered by the GUI are stored in the system credential store where possible (Windows Credential Manager, macOS Keychain, Linux Secret Service). If the store is unavailable, fingerprints are kept in a permission-restricted `known_hosts.json` and the password is entered on every connection.
+- Private keys are read from their original path and never copied; private-key passphrases are not stored. Passwords and raw terminal output are not logged.
 
-配置目录：Windows 为 `%LOCALAPPDATA%\TermBridge\`，Linux 和 macOS 为 `$XDG_CONFIG_HOME/termbridge/`（默认 `~/.config/termbridge/`）。其中 `host.json`、`host_key` 属于接收端，`profiles.json` 属于连接端。
+Configuration directory: `%LOCALAPPDATA%\TermBridge\` on Windows, and `$XDG_CONFIG_HOME/termbridge/` (default `~/.config/termbridge/`) on Linux and macOS. `host.json` and `host_key` belong to the host; `profiles.json` belongs to the client.
 
-## 作为系统服务运行（Linux）
+## Running as a system service (Linux)
 
-无桌面环境的 Linux 可以只编译命令行工具：
+On a Linux machine without a desktop environment you can build only the command-line tool:
 
 ```sh
-cargo build -p termbridge --release     # 输出 target/release/termbridge
+cargo build -p termbridge --release     # output: target/release/termbridge
 ```
 
-创建 `~/.config/systemd/user/termbridge.service`：
+Create `~/.config/systemd/user/termbridge.service`:
 
 ```ini
 [Unit]
 Description=TermBridge host
 
 [Service]
-ExecStart=/绝对路径/termbridge host run
+ExecStart=/absolute/path/to/termbridge host run
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 ```
 
-启用服务：
+Enable the service:
 
 ```sh
 systemctl --user enable --now termbridge
-loginctl enable-linger $USER    # 用户未登录时保持运行
+loginctl enable-linger $USER    # keep running while the user is logged out
 ```
 
-服务重启后原有会话不会恢复。
+Existing sessions are not restored when the service restarts.
 
-## 桌面端说明
+## Desktop app notes
 
-- 关闭窗口时程序隐藏到托盘，点击托盘图标可恢复窗口。通过托盘菜单中的「退出 TermBridge」退出程序，退出时会停止本机接收端并结束其上的会话。
-- 桌面端不会开机自启，启动时也不会自动启用接收端。需要无人值守运行时，请使用命令行工具配合系统服务。
+- Closing the window hides the app to the tray; click the tray icon to restore it. To quit, use "Quit TermBridge" (「退出 TermBridge」) in the tray menu, which stops this machine's host and ends its sessions.
+- The desktop app does not start at login and does not enable the host automatically on launch. For unattended operation, use the command-line tool together with a system service.
 
-## 从源码构建
+## Building from source
 
-依赖：Rust stable、Node.js 22、Python 3，以及 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)（Linux 需要 WebKitGTK 4.1）。
+Requirements: Rust stable, Node.js 22, Python 3, and the [Tauri 2 system dependencies](https://v2.tauri.app/start/prerequisites/) (Linux needs WebKitGTK 4.1).
 
 ```sh
 cargo test --workspace
-cargo build -p termbridge          # 仅构建命令行工具
+cargo build -p termbridge          # command-line tool only
 
 cd apps/desktop
 npm ci
-npm run build:windows              # 或 build:linux、build:macos
+npm run build:windows              # or build:linux, build:macos
 ```
 
-macOS 构建的是 Universal 包，需要先安装两个编译目标：
+The macOS build is a universal package, so both compile targets must be installed first:
 
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-打包前会由 `scripts/prepare_sidecar.py` 编译命令行工具并放入 Tauri 的 sidecar 目录。安装包输出到 `apps/desktop/src-tauri/target/release/bundle/`，macOS 输出到 `apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/`。
+Before packaging, `scripts/prepare_sidecar.py` builds the command-line tool and places it in Tauri's sidecar directory. Installers are written to `apps/desktop/src-tauri/target/release/bundle/`, and to `apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/` on macOS.
 
-### 发布
+### Releasing
 
-将 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json`、`apps/desktop/src-tauri/Cargo.toml` 中的版本号更新为一致后，推送对应的标签（如 `v0.2.1`）。CI（`.github/workflows/build.yml`）在三个平台构建成功后自动创建 Release 并上传安装包；标签与版本号不一致时不会发布。
+Make the version number identical in `Cargo.toml`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json` and `apps/desktop/src-tauri/Cargo.toml`, then push the matching tag (for example `v0.2.1`). Once the build succeeds on all three platforms, CI (`.github/workflows/build.yml`) creates the Release and uploads the installers automatically; nothing is published if the tag and the version number disagree.
 
-## 项目结构
+## Project layout
 
 ```
-crates/protocol   消息格式（JSON Lines，经 SSH 子系统 termbridge-v2 传输）
-crates/host       终端进程（portable-pty）、会话管理、输出缓冲与重放、画面快照（vt100）、控制权、输入偏移
-crates/app        SSH 服务端与客户端、配置与认证、termbridge 命令行
-apps/desktop      桌面端（Tauri 2、TypeScript、xterm.js）
-scripts           构建脚本
+crates/protocol   message format (JSON Lines over the termbridge-v2 SSH subsystem)
+crates/host       terminal process (portable-pty), session management, output buffering and replay, screen snapshot (vt100), control, input offsets
+crates/app        SSH server and client, configuration and authentication, the termbridge CLI
+apps/desktop      desktop app (Tauri 2, TypeScript, xterm.js)
+scripts           build scripts
 ```
 
-## 开发状态
+## Development status
 
-自动化测试在 GitHub Actions 的 Windows、Linux、macOS 上通过，覆盖按键收发、断线续传、控制权接管、大量输出时的输入、Ctrl+C 中断和命令行 raw 模式附着等场景。
+Automated tests pass on GitHub Actions for Windows, Linux and macOS. They cover key input and output, resuming after a disconnect, taking over control, typing during heavy output, Ctrl+C interruption and raw-mode attach from the command line.
 
-尚未完成的验证：
+Verification still to be done:
 
-- 0.2 桌面端和命令行的人工验收（输入法、剪贴板、快捷键、全屏程序等）
-- Linux 与 macOS 之间的实机互连
-- Windows 用户注销后终端进程的清理
+- Manual acceptance of the 0.2 desktop app and command line (input methods, clipboard, shortcuts, full-screen programs, etc.)
+- Real-device interconnection between Linux and macOS
+- Cleanup of terminal processes after a Windows user logs off
 
-已知限制：
+Known limitations:
 
-- 不支持断线自动重连
-- 重新附着时滚动历史仅恢复纯文本，不含颜色
-- 不提供中继和 NAT 穿透
-- 接收端重启后会话不保留
-- Windows 上命令行退出附着后，可能会吞掉一个按键
+- No automatic reconnection after a disconnect
+- When re-attaching, scrollback history is restored as plain text only, without colors
+- No relay or NAT traversal
+- Sessions are not preserved across host restarts
+- On Windows, the command line may swallow one keystroke after detaching
 
-## 许可证
+## License
 
 MIT
