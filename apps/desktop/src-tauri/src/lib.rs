@@ -115,7 +115,7 @@ pub fn run() {
 }
 
 /// 隐藏主窗口到托盘（顶栏按钮调用）。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
     let win = app
         .get_webview_window("main")
@@ -124,7 +124,7 @@ fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// 前端切换界面语言：后端消息与托盘菜单随之切换。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn set_language(app: tauri::AppHandle, lang: String) -> Result<(), String> {
     let lang = Lang::parse(&lang).ok_or_else(|| format!("unsupported language: {lang}"))?;
     i18n::set_lang(lang);
@@ -161,4 +161,96 @@ fn disable_browser_accelerators(app: &tauri::AppHandle) {
         };
         let _ = settings3.SetAreBrowserAcceleratorKeysEnabled(false);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use regex::Regex;
+
+    const COMMANDS_RS: &str = include_str!("commands.rs");
+    const LIB_RS: &str = include_str!("lib.rs");
+    const IPC_TS: &str = include_str!("../../src/ipc.ts");
+
+    /// 后端命令名 -> (属性文本, 参数名集合)，不含 `app` / `state` 这类由 Tauri 注入的参数。
+    fn backend_commands() -> BTreeMap<String, (String, BTreeSet<String>)> {
+        let re = Regex::new(
+            r"(?s)#\[tauri::command([^\]]*)\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\((.*?)\)\s*->",
+        )
+        .unwrap();
+        let mut out = BTreeMap::new();
+        for src in [COMMANDS_RS, LIB_RS] {
+            for caps in re.captures_iter(src) {
+                let args = caps[3]
+                    .split(',')
+                    .filter_map(|arg| arg.split(':').next())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && !matches!(*name, "app" | "state"))
+                    .map(str::to_string)
+                    .collect();
+                out.insert(caps[2].to_string(), (caps[1].to_string(), args));
+            }
+        }
+        out
+    }
+
+    /// 前端（`src/ipc.ts`）调用的命令名 -> 它传的参数名集合。
+    fn frontend_calls() -> BTreeMap<String, BTreeSet<String>> {
+        let re = Regex::new(r#"invoke<[^>]*>\(\s*"(\w+)"\s*(?:,\s*\{([^}]*)\})?"#).unwrap();
+        re.captures_iter(IPC_TS)
+            .map(|caps| {
+                let keys = caps
+                    .get(2)
+                    .map(|m| m.as_str())
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|item| item.split(':').next())
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                (caps[1].to_string(), keys)
+            })
+            .collect()
+    }
+
+    /// Tauri 2 默认按 camelCase 解析命令参数，而前端用 snake_case（`bind_addr`、`session_id` ……）。
+    /// 命令不声明 `rename_all = "snake_case"` 时，前端的每次调用都会报
+    /// "command … missing required key bindAddr"。
+    #[test]
+    fn commands_accept_snake_case_argument_names() {
+        let commands = backend_commands();
+        assert!(commands.len() >= 20, "found only {} commands", commands.len());
+        let missing: Vec<_> = commands
+            .iter()
+            .filter(|(_, (attr, args))| {
+                args.iter().any(|a| a.contains('_')) && !attr.contains(r#"rename_all = "snake_case""#)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "commands with multi-word arguments must use #[tauri::command(rename_all = \"snake_case\")]: {missing:?}"
+        );
+    }
+
+    /// 前端调用的每个命令都存在，传的参数名与后端声明完全一致。
+    #[test]
+    fn frontend_calls_match_backend_arguments() {
+        let backend = backend_commands();
+        let calls = frontend_calls();
+        assert!(calls.len() >= 15, "found only {} invoke calls in ipc.ts", calls.len());
+        let mut problems = Vec::new();
+        for (cmd, keys) in &calls {
+            match backend.get(cmd) {
+                None => problems.push(format!("ipc.ts calls `{cmd}` but no such command exists")),
+                Some((_, args)) if args != keys => {
+                    problems.push(format!("`{cmd}`: frontend sends {keys:?}, backend takes {args:?}"))
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 }

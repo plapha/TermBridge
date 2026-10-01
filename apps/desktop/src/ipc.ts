@@ -45,10 +45,16 @@ export function markBackendUnavailable(): void {
   backendAvailable = false;
 }
 
-/** 后端命令的真实错误信息（Tauri reject 的是 IpcError.message 字符串）。 */
+/**
+ * 后端命令的真实错误信息。Tauri 对命令返回的 `IpcError { message }` 会 reject 成对象
+ * `{ message }`，自己的参数解析错误则是字符串；两者都要取出文字，否则会显示 `[object Object]`。
+ */
 export function errorText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+    return (err as { message: string }).message;
+  }
   return String(err);
 }
 

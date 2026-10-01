@@ -51,6 +51,9 @@ export class TerminalView {
     this.container = container;
     this.callbacks = callbacks;
     this.term = new Terminal({
+      // Unicode11Addon 与 `unicode.activeVersion` 是 xterm.js 的 proposed API，不开这个选项会直接抛错，
+      // 终端就根本创建不出来。
+      allowProposedApi: true,
       disableStdin: false,
       convertEol: false,
       scrollback: 5000,

@@ -405,3 +405,20 @@ mod ssh_key_tests {
         assert!(legacy.verify_key("u", &key.public_key()));
     }
 }
+
+#[cfg(test)]
+mod keyring_tests {
+    /// keyring 3 在没有启用任何平台后端时会悄悄退回「内存模拟存储」：`set_password` 成功，
+    /// 但换一个 `Entry` 就读不回来。那样“记住密码”和 GUI 里确认过的主机指纹都不会真正保存。
+    /// Cargo.toml 里必须启用各平台的真实后端。
+    #[test]
+    fn keyring_uses_a_real_credential_store_not_the_mock() {
+        let builder = keyring::default::default_credential_builder();
+        assert!(
+            !builder
+                .as_any()
+                .is::<keyring::mock::MockCredentialBuilder>(),
+            "keyring is using the in-memory mock; enable the platform features in Cargo.toml"
+        );
+    }
+}
