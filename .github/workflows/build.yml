@@ -55,18 +55,29 @@ jobs:
           if-no-files-found: error
 
   # 推送 v* 标签时，三个平台都构建成功后发布到 Releases。
+  # 也可以在 main 上手动运行本工作流（workflow_dispatch）来发布：用于无法推送标签的环境，
+  # 标签 v<tauri.conf.json 的版本> 由 gh release create 在该提交上创建；标签已存在时报错。
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Tag must match app version
+      - name: Resolve the release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
-          test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" >/dev/null 2>&1; then
+            echo "tag v$version already exists; bump the version first"
+            exit 1
+          fi
+          echo "name=v$version" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -74,4 +85,5 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "TermBridge $GITHUB_REF_NAME" --generate-notes
+          TAG: ${{ steps.tag.outputs.name }}
+        run: gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "TermBridge $TAG" --generate-notes

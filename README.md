@@ -221,7 +221,7 @@ Before packaging, `scripts/prepare_sidecar.py` builds the command-line tool and 
 
 ### Releasing
 
-Make the version number identical in `Cargo.toml`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json` and `apps/desktop/src-tauri/Cargo.toml`, then push the matching tag (for example `v0.2.1`). Once the build succeeds on all three platforms, CI (`.github/workflows/build.yml`) creates the Release and uploads the installers automatically; nothing is published if the tag and the version number disagree.
+Make the version number identical in `Cargo.toml`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json` and `apps/desktop/src-tauri/Cargo.toml`, then push the matching tag (for example `v0.2.1`). Once the build succeeds on all three platforms, CI (`.github/workflows/build.yml`) creates the Release and uploads the installers automatically; nothing is published if the tag and the version number disagree. Where pushing a tag is not possible, run the same workflow manually on `main` (Actions → Cross-platform build → Run workflow): it creates the tag `v<version>` on that commit and publishes the Release, and fails if the tag already exists.
 
 ## Project layout
 
