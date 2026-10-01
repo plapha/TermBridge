@@ -201,13 +201,13 @@ fn to_front_info(info: &SessionInfo, meta: &SessionMeta) -> SessionMeta {
 
 /* ---------- profile CRUD ---------- */
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn list_profiles() -> IpcResult<Vec<ProfileDto>> {
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     Ok(profiles.items.iter().map(front_profile).collect())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn save_profile(draft: ProfileDraft) -> IpcResult<ProfileDto> {
     let auth = match draft.auth.as_str() {
         "password" => config::AuthKind::Password,
@@ -275,7 +275,7 @@ pub fn save_profile(draft: ProfileDraft) -> IpcResult<ProfileDto> {
     Ok(front_profile(&profile))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn remove_profile(id: String) -> IpcResult<()> {
     let uid = Uuid::parse_str(&id).map_err(ipc)?;
     let mut profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
@@ -292,7 +292,7 @@ pub fn remove_profile(id: String) -> IpcResult<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn store_profile_password(profile_id: String, password: String) -> IpcResult<()> {
     let uid = Uuid::parse_str(&profile_id).map_err(ipc)?;
     let mut profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
@@ -337,7 +337,7 @@ fn host_fingerprint() -> Option<String> {
     read_host_config().ok().flatten().and_then(|c| c.fingerprint().ok())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn host_status(app: tauri::AppHandle) -> IpcResult<HostStatus> {
     let mut status = host_status_inner(&app)?;
     status.fingerprint = host_fingerprint();
@@ -345,7 +345,7 @@ pub fn host_status(app: tauri::AppHandle) -> IpcResult<HostStatus> {
 }
 
 /// 用户显式选择密码或复用 SSH 授权公钥；两者不会混用或隐式放开认证。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn init_host(app: tauri::AppHandle, password: Option<String>, authorized_keys_path: Option<String>) -> IpcResult<HostStatus> {
     match (password, authorized_keys_path) {
         (Some(password), None) => { config::init_host(&password).map_err(ipc)?; }
@@ -362,7 +362,7 @@ pub fn init_host(app: tauri::AppHandle, password: Option<String>, authorized_key
 }
 
 /// 已初始化主机改用 SSH 密钥；GUI 接收任务运行中必须先明确停止。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn switch_host_to_keys(app: tauri::AppHandle, authorized_keys_path: String) -> IpcResult<HostStatus> {
     let state: tauri::State<AppState> = app.state();
     if state.host_running.load(Ordering::SeqCst) {
@@ -377,7 +377,7 @@ pub fn switch_host_to_keys(app: tauri::AppHandle, authorized_keys_path: String) 
     host_status(app)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn set_host_enabled(app: tauri::AppHandle, enabled: bool, bind_addr: String) -> IpcResult<HostStatus> {
     let mut config = read_host_config()?
         .ok_or_else(|| ipc(tr!("The host is not initialized yet: choose a password or SSH authorized keys first", "接收端尚未初始化：请先选择密码或 SSH 授权公钥")))?;
@@ -454,7 +454,7 @@ pub fn stop_host_persist(app: &tauri::AppHandle) {
 /* ---------- 指纹确认（绝无 TOFU 自动接受） ---------- */
 
 /// 仅探测：返回服务端实际指纹，供 GUI 展示；不进行认证、不落任何信任记录。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn probe_host(host: String, port: u16) -> IpcResult<FingerprintDto> {
     let fp = termbridge::client::probe_host(&host, port).await.map_err(ipc)?;
     let pins = [confirmed_fingerprint(&host, port), known_hosts_entry(&host, port)];
@@ -467,7 +467,7 @@ pub async fn probe_host(host: String, port: u16) -> IpcResult<FingerprintDto> {
 }
 
 /// GUI 显式确认：后端重新 probe 并核对前端展示的指纹，再写入受信任记录。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn confirm_host_fingerprint(
     host: String,
     port: u16,
@@ -831,7 +831,7 @@ async fn forward_event(
     let _ = tx.send(front).await;
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn list_sessions(app: tauri::AppHandle) -> IpcResult<Vec<SessionMeta>> {
     let state: tauri::State<AppState> = app.state();
     let sessions = state.sessions.lock().unwrap();
@@ -857,7 +857,7 @@ fn parse_host_fingerprint(profile: &Profile, password_missing_hint: bool) -> Ipc
 }
 
 /// 只返回是否需要 SSH 私钥口令；私钥内容与口令均不返回给前端。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn key_passphrase_required(profile_id: String) -> IpcResult<bool> {
     let id = Uuid::parse_str(&profile_id).map_err(ipc)?;
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
@@ -898,7 +898,7 @@ fn auth_method(profile: &Profile, password: Option<String>) -> IpcResult<AuthMet
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_session(
     app: tauri::AppHandle,
     profile_id: String,
@@ -966,7 +966,7 @@ pub async fn create_session(
 }
 
 /// 在另一连接端创建的会话也可通过配置列出并附着，不会偷偷创建替代进程。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn list_remote_sessions(profile_id: String, password: Option<String>) -> IpcResult<Vec<SessionInfo>> {
     let profiles: Profiles = read_json(&profiles_path()).map_err(ipc)?;
     let id = Uuid::parse_str(&profile_id).map_err(ipc)?;
@@ -983,7 +983,7 @@ pub async fn list_remote_sessions(profile_id: String, password: Option<String>) 
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn connect_existing_session(
     app: tauri::AppHandle, profile_id: String, session_id: String, password: Option<String>,
 ) -> IpcResult<serde_json::Value> {
@@ -1034,7 +1034,7 @@ pub async fn connect_existing_session(
     Ok(serde_json::json!({ "session": to_front_info(&remote, &session.info()) }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn attach_session(
     app: tauri::AppHandle,
     session_id: String,
@@ -1075,7 +1075,7 @@ pub async fn attach_session(
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn detach_session(
     app: tauri::AppHandle,
     session_id: String,
@@ -1091,7 +1091,7 @@ pub async fn detach_session(
     Ok(serde_json::json!(session.info()))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn end_session(
     app: tauri::AppHandle,
     session_id: String,
@@ -1115,7 +1115,7 @@ pub async fn end_session(
 }
 
 /// 原始终端输入：直接经 InputSender 发送，不等待响应、不排在 pump 的请求后面。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn send_input(
     app: tauri::AppHandle,
     session_id: String,
@@ -1147,7 +1147,7 @@ pub async fn send_input(
 }
 
 /// 控制者设置远端 PTY 尺寸；由前端 fit 结果驱动。
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resize_session(
     app: tauri::AppHandle,
     session_id: String,
@@ -1169,7 +1169,7 @@ pub async fn resize_session(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn take_control(
     app: tauri::AppHandle,
     session_id: String,
