@@ -221,7 +221,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ### 发布
 
-将 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json`、`apps/desktop/src-tauri/Cargo.toml` 中的版本号更新为一致后，推送对应的标签（如 `v0.2.1`）。CI（`.github/workflows/build.yml`）在三个平台构建成功后自动创建 Release 并上传安装包；标签与版本号不一致时不会发布。
+将 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json`、`apps/desktop/src-tauri/Cargo.toml` 中的版本号更新为一致后，推送对应的标签（如 `v0.2.1`）。CI（`.github/workflows/build.yml`）在三个平台构建成功后自动创建 Release 并上传安装包；标签与版本号不一致时不会发布。无法推送标签时，可以在 `main` 上手动运行同一个工作流（Actions → Cross-platform build → Run workflow）：它会在该提交上创建标签 `v<版本号>` 并发布 Release，标签已存在时会失败。
 
 ## 项目结构
 
